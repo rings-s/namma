@@ -6,4 +6,8 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "django>=6.0.6",
+<<<<<<< HEAD
+=======
+    "djangorestframework>=3.17.1",
+>>>>>>> a3235b4 (feat(db): initialize core relational schema)
 ]
