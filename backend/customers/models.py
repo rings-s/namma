@@ -1,8 +1,3 @@
-<<<<<<< HEAD
-from django.db import models
-
-# Create your models here.
-=======
 """Customers: profiles, preferences, clinical notes and documents."""
 
 from django.conf import settings
@@ -27,7 +22,7 @@ class Customer(SoftDeleteModel, BaseModel):
         OTHER = "other", "Other"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="customers",
     )
@@ -65,7 +60,7 @@ class CustomerPreference(BaseModel):
         Customer, on_delete=models.CASCADE, related_name="preferences"
     )
     preferred_branch = models.ForeignKey(
-        "organnizations.Branch",
+        "organizations.Branch",
         on_delete=models.SET_NULL,
         related_name="+",
         null=True,
@@ -96,7 +91,7 @@ class ClinicalNote(BaseModel):
         GENERAL = "general", "General"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="clinical_notes",
     )
@@ -135,7 +130,7 @@ class ClinicalNote(BaseModel):
 
 class CustomerDocument(BaseModel):
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="customer_documents",
     )
@@ -158,4 +153,133 @@ class CustomerDocument(BaseModel):
 
     def __str__(self):
         return f"{self.document_type} for {self.customer}"
->>>>>>> a3235b4 (feat(db): initialize core relational schema)
+
+
+# ---------------------------------------------------------------------------
+# Segments
+# ---------------------------------------------------------------------------
+
+
+class CustomerSegment(BaseModel):
+    """A named audience. Manual segments hold whatever memberships staff
+    curate; dynamic segments re-evaluate ``criteria`` on a schedule; AI
+    segments are written by the recommendation pipeline."""
+
+    class SegmentType(models.TextChoices):
+        MANUAL = "manual", "Manual"
+        DYNAMIC = "dynamic", "Dynamic"
+        AI = "ai", "AI-Generated"
+
+    organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.CASCADE,
+        related_name="customer_segments",
+    )
+    name = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    segment_type = models.CharField(
+        max_length=10, choices=SegmentType.choices, default=SegmentType.MANUAL
+    )
+    #: Dynamic criteria, all optional and AND-ed together:
+    #: min_visits, min_total_spent, last_visit_within_days,
+    #: last_visit_not_within_days (lapsed customers), source, gender.
+    criteria = models.JSONField(default=dict, blank=True)
+    is_active = models.BooleanField(default=True)
+    last_refreshed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["organization", "name"], name="uniq_segment_name_per_org"
+            )
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class CustomerSegmentMembership(BaseModel):
+    segment = models.ForeignKey(
+        CustomerSegment, on_delete=models.CASCADE, related_name="memberships"
+    )
+    customer = models.ForeignKey(
+        Customer, on_delete=models.CASCADE, related_name="segment_memberships"
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["segment", "customer"], name="uniq_segment_membership"
+            )
+        ]
+        indexes = [
+            models.Index(fields=["customer"]),
+        ]
+
+    def __str__(self):
+        return f"{self.customer} in {self.segment}"
+
+
+# ---------------------------------------------------------------------------
+# Surveys & NPS
+# ---------------------------------------------------------------------------
+
+
+class Survey(BaseModel):
+    class SurveyType(models.TextChoices):
+        NPS = "nps", "NPS"
+        POST_VISIT = "post_visit", "Post-Visit"
+        CUSTOM = "custom", "Custom"
+
+    organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.CASCADE,
+        related_name="surveys",
+    )
+    name = models.CharField(max_length=255)
+    survey_type = models.CharField(
+        max_length=20, choices=SurveyType.choices, default=SurveyType.NPS
+    )
+    question = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+    #: Hours after appointment completion before the survey dispatch fires.
+    send_delay_hours = models.PositiveIntegerField(default=2)
+
+    def __str__(self):
+        return self.name
+
+
+class SurveyResponse(BaseModel):
+    class Sentiment(models.TextChoices):
+        POSITIVE = "positive", "Positive"
+        NEUTRAL = "neutral", "Neutral"
+        NEGATIVE = "negative", "Negative"
+
+    survey = models.ForeignKey(
+        Survey, on_delete=models.CASCADE, related_name="responses"
+    )
+    customer = models.ForeignKey(
+        Customer, on_delete=models.CASCADE, related_name="survey_responses"
+    )
+    appointment = models.ForeignKey(
+        "operations.Appointment",
+        on_delete=models.SET_NULL,
+        related_name="survey_responses",
+        null=True,
+        blank=True,
+    )
+    #: NPS: 0-10. Post-visit/custom: 1-5.
+    score = models.PositiveSmallIntegerField(null=True, blank=True)
+    comment = models.TextField(blank=True)
+    sentiment = models.CharField(max_length=10, choices=Sentiment.choices, blank=True)
+    responded_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["survey", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.survey} response from {self.customer}"

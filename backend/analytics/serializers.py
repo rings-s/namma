@@ -5,6 +5,8 @@ from analytics.models import (
     DailyBranchMetric,
     DailyEmployeeMetric,
     DailyMetric,
+    Goal,
+    GoalMilestone,
     Report,
 )
 from core.api import AUDIT_FIELDS
@@ -40,3 +42,25 @@ class DailyEmployeeMetricSerializer(serializers.ModelSerializer):
     class Meta:
         model = DailyEmployeeMetric
         fields = "__all__"
+
+
+class GoalMilestoneSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = GoalMilestone
+        fields = "__all__"
+        read_only_fields = (*AUDIT_FIELDS, "reached_at")
+
+
+class GoalSerializer(serializers.ModelSerializer):
+    milestones = GoalMilestoneSerializer(many=True, read_only=True)
+    progress_percent = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Goal
+        fields = "__all__"
+        read_only_fields = (*AUDIT_FIELDS, "current_value", "status")
+
+    def get_progress_percent(self, goal):
+        if not goal.target_value:
+            return None
+        return round(float(goal.current_value / goal.target_value) * 100, 1)

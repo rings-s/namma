@@ -24,5 +24,8 @@ router.register("cancellation-policies", views.CancellationPolicyViewSet)
 router.register("queue-tickets", views.QueueTicketViewSet)
 router.register("payroll-periods", views.PayrollPeriodViewSet)
 router.register("commission-entries", views.CommissionEntryViewSet)
+router.register("commission-rules", views.CommissionRuleViewSet)
+router.register("employee-cost-components", views.EmployeeCostComponentViewSet)
+router.register("waitlist-entries", views.WaitlistEntryViewSet)
 
 urlpatterns = router.urls

@@ -3,6 +3,7 @@
 import uuid
 
 from django.conf import settings
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
 from django.utils import timezone
 
@@ -10,6 +11,7 @@ from django.utils import timezone
 # ---------------------------------------------------------------------------
 # Shared enums
 # ---------------------------------------------------------------------------
+
 
 class Weekday(models.IntegerChoices):
     MONDAY = 0, "Monday"
@@ -32,6 +34,7 @@ class Channel(models.TextChoices):
 # ---------------------------------------------------------------------------
 # Abstract bases
 # ---------------------------------------------------------------------------
+
 
 class TimeStampedModel(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
@@ -93,6 +96,47 @@ class SoftDeleteModel(models.Model):
 # Reference models
 # ---------------------------------------------------------------------------
 
+
+class IdempotencyRecord(BaseModel):
+    """Stored outcome of a mutating request that carried an Idempotency-Key.
+
+    At-least-once clients (mobile/PWA retrying over flaky connections) replay
+    the same key; the API answers with the stored response instead of
+    re-executing the mutation. Keyed per user so tenants cannot collide or
+    probe each other's keys.
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="idempotency_records",
+    )
+    key = models.CharField(max_length=255)
+    method = models.CharField(max_length=10)
+    path = models.CharField(max_length=255)
+    response_status = models.PositiveSmallIntegerField()
+    # DRF response data still carries UUID/Decimal/datetime objects before
+    # rendering; the Django encoder coerces them the same way the JSON
+    # renderer would.
+    response_body = models.JSONField(
+        default=dict, blank=True, encoder=DjangoJSONEncoder
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "key", "method", "path"],
+                name="uniq_idempotency_key_per_user_endpoint",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["created_at"]),  # retention sweeps
+        ]
+
+    def __str__(self):
+        return f"{self.method} {self.path} [{self.key}]"
+
+
 class Country(BaseModel):
     name = models.CharField(max_length=120)
     code = models.CharField(max_length=2, unique=True)  # ISO 3166-1 alpha-2
@@ -122,7 +166,7 @@ class Currency(BaseModel):
 
 class Translation(BaseModel):
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="translations",
     )
@@ -149,7 +193,7 @@ class Translation(BaseModel):
 
 class AuditLog(BaseModel):
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="audit_logs",
         null=True,
@@ -184,7 +228,7 @@ class AuditLog(BaseModel):
 
 class AccessLog(BaseModel):
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="access_logs",
         null=True,

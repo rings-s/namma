@@ -1,8 +1,3 @@
-<<<<<<< HEAD
-from django.db import models
-
-# Create your models here.
-=======
 """AI assistant: conversations, messages and recommendations."""
 
 from django.conf import settings
@@ -13,7 +8,7 @@ from core.models import BaseModel
 
 class AIConversation(BaseModel):
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="ai_conversations",
     )
@@ -66,7 +61,7 @@ class AIRecommendation(BaseModel):
         ACTIONED = "actioned", "Actioned"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="ai_recommendations",
     )
@@ -90,4 +85,3 @@ class AIRecommendation(BaseModel):
 
     def __str__(self):
         return self.title
->>>>>>> a3235b4 (feat(db): initialize core relational schema)

@@ -1,8 +1,3 @@
-<<<<<<< HEAD
-from django.db import models
-
-# Create your models here.
-=======
 """Financials: invoicing, payments, ledger, ZATCA e-invoicing,
 SaaS plans/subscriptions and dunning."""
 
@@ -35,6 +30,7 @@ class Gateway(models.TextChoices):
 # Document numbering & invoices
 # ---------------------------------------------------------------------------
 
+
 class DocumentSequence(BaseModel):
     class DocumentType(models.TextChoices):
         INVOICE = "invoice", "Invoice"
@@ -45,12 +41,12 @@ class DocumentSequence(BaseModel):
         TICKET = "ticket", "Ticket"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="document_sequences",
     )
     branch = models.ForeignKey(
-        "organnizations.Branch",
+        "organizations.Branch",
         on_delete=models.CASCADE,
         related_name="document_sequences",
         null=True,
@@ -83,7 +79,7 @@ class Invoice(BaseModel):
         VOID = "void", "Void"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="invoices",
     )
@@ -133,7 +129,7 @@ class CreditNote(BaseModel):
         VOID = "void", "Void"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="credit_notes",
     )
@@ -163,7 +159,7 @@ class DebitNote(BaseModel):
         VOID = "void", "Void"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="debit_notes",
     )
@@ -190,6 +186,7 @@ class DebitNote(BaseModel):
 # Payments
 # ---------------------------------------------------------------------------
 
+
 class PaymentIntent(BaseModel):
     class Status(models.TextChoices):
         REQUIRES_PAYMENT = "requires_payment", "Requires Payment"
@@ -200,7 +197,7 @@ class PaymentIntent(BaseModel):
         EXPIRED = "expired", "Expired"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="payment_intents",
     )
@@ -251,7 +248,7 @@ class Payment(BaseModel):
         PARTIALLY_REFUNDED = "partially_refunded", "Partially Refunded"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="payments",
     )
@@ -307,7 +304,7 @@ class Refund(BaseModel):
         PARTIAL = "partial", "Partial"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="refunds",
     )
@@ -347,7 +344,7 @@ class PaymentWebhookEvent(BaseModel):
         IGNORED = "ignored", "Ignored"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="payment_webhook_events",
         null=True,
@@ -358,7 +355,9 @@ class PaymentWebhookEvent(BaseModel):
     event_type = models.CharField(max_length=100)
     payload = models.JSONField(default=dict, blank=True)
     processing_status = models.CharField(
-        max_length=20, choices=ProcessingStatus.choices, default=ProcessingStatus.PENDING
+        max_length=20,
+        choices=ProcessingStatus.choices,
+        default=ProcessingStatus.PENDING,
     )
     processed_at = models.DateTimeField(null=True, blank=True)
 
@@ -371,7 +370,7 @@ class PaymentWebhookEvent(BaseModel):
 
 class Settlement(BaseModel):
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="settlements",
     )
@@ -412,6 +411,7 @@ class SettlementLine(BaseModel):
 # Ledger
 # ---------------------------------------------------------------------------
 
+
 class LedgerAccount(BaseModel):
     class AccountType(models.TextChoices):
         ASSET = "asset", "Asset"
@@ -421,7 +421,7 @@ class LedgerAccount(BaseModel):
         EXPENSE = "expense", "Expense"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="ledger_accounts",
     )
@@ -444,7 +444,7 @@ class LedgerAccount(BaseModel):
 
 class LedgerEntry(BaseModel):
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="ledger_entries",
     )
@@ -485,6 +485,7 @@ class LedgerEntry(BaseModel):
 # ZATCA e-invoicing
 # ---------------------------------------------------------------------------
 
+
 class ZatcaDevice(BaseModel):
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
@@ -494,22 +495,27 @@ class ZatcaDevice(BaseModel):
         REVOKED = "revoked", "Revoked"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="zatca_devices",
     )
     branch = models.ForeignKey(
-        "organnizations.Branch",
+        "organizations.Branch",
         on_delete=models.SET_NULL,
         related_name="zatca_devices",
         null=True,
         blank=True,
     )
     device_name = models.CharField(max_length=255)
-    compliance_csid = models.CharField(max_length=255, blank=True)
-    production_csid = models.CharField(max_length=255, blank=True)
+    compliance_csid = models.TextField(blank=True)
+    production_csid = models.TextField(blank=True)
     certificate = models.TextField(blank=True)
     private_key_encrypted = models.TextField(blank=True)
+    # CSID API credentials: the secret returned with each CSID (encrypted at
+    # rest, same Fernet key as the private key) and the compliance request id
+    # that links the compliance CSID to the production CSID request.
+    csid_secret_encrypted = models.TextField(blank=True)
+    compliance_request_id = models.CharField(max_length=64, blank=True)
     status = models.CharField(
         max_length=20, choices=Status.choices, default=Status.PENDING
     )
@@ -543,7 +549,7 @@ class EInvoice(BaseModel):
         FAILED = "failed", "Failed"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="e_invoices",
     )
@@ -561,7 +567,12 @@ class EInvoice(BaseModel):
     invoice_type = models.CharField(
         max_length=20, choices=InvoiceType.choices, default=InvoiceType.SIMPLIFIED
     )
+    # The signed UBL document is the legal artifact: stored inline (no object
+    # storage layer yet), ubl_xml_url stays for a future offload to S3-style
+    # storage. invoice_hash anchors the PIH chain and the Fatoora submission.
+    ubl_xml = models.TextField(blank=True)
     ubl_xml_url = models.URLField(blank=True)
+    invoice_hash = models.CharField(max_length=64, blank=True)
     cryptographic_stamp = models.TextField(blank=True)
     qr_code_tlv = models.TextField(blank=True)
     previous_invoice_hash = models.CharField(max_length=255, blank=True)
@@ -574,6 +585,15 @@ class EInvoice(BaseModel):
         ordering = ["-created_at"]
         indexes = [
             models.Index(fields=["organization", "status"]),
+        ]
+        constraints = [
+            # The ICV chain per device must never fork — enforced by the
+            # database, not just by the counter lock in the service layer.
+            models.UniqueConstraint(
+                fields=["zatca_device", "icv"],
+                condition=models.Q(icv__gt=0),
+                name="uniq_einvoice_icv_per_device",
+            )
         ]
 
     def __str__(self):
@@ -609,6 +629,7 @@ class EInvoiceSubmission(BaseModel):
 # ---------------------------------------------------------------------------
 # SaaS plans, subscriptions & billing
 # ---------------------------------------------------------------------------
+
 
 class Plan(BaseModel):
     name = models.CharField(max_length=100)
@@ -656,7 +677,7 @@ class Subscription(BaseModel):
         EXPIRED = "expired", "Expired"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="subscriptions",
     )
@@ -711,7 +732,7 @@ class SubscriptionInvoice(BaseModel):
 
 class UsageRecord(BaseModel):
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="usage_records",
     )
@@ -760,4 +781,3 @@ class DunningAttempt(BaseModel):
 
     def __str__(self):
         return f"Dunning #{self.attempt_number} for {self.subscription}"
->>>>>>> a3235b4 (feat(db): initialize core relational schema)

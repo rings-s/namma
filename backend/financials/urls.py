@@ -1,6 +1,15 @@
+from django.urls import path
 from rest_framework.routers import DefaultRouter
 
 from financials import views
+
+urlpatterns = [
+    path(
+        "webhooks/moyasar/",
+        views.MoyasarWebhookView.as_view(),
+        name="moyasar_webhook",
+    ),
+]
 
 router = DefaultRouter()
 router.register("document-sequences", views.DocumentSequenceViewSet)
@@ -26,4 +35,4 @@ router.register("subscription-invoices", views.SubscriptionInvoiceViewSet)
 router.register("usage-records", views.UsageRecordViewSet)
 router.register("dunning-attempts", views.DunningAttemptViewSet)
 
-urlpatterns = router.urls
+urlpatterns += router.urls

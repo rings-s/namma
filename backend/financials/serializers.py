@@ -111,13 +111,18 @@ class LedgerEntrySerializer(serializers.ModelSerializer):
 class ZatcaDeviceSerializer(serializers.ModelSerializer):
     class Meta:
         model = ZatcaDevice
-        fields = "__all__"
-        read_only_fields = AUDIT_FIELDS
-        extra_kwargs = {
-            # Never expose key material through the API.
-            "private_key_encrypted": {"write_only": True},
-            "certificate": {"write_only": True},
-        }
+        # Key material and CSID credentials never cross the API in either
+        # direction; the onboarding pipeline is their only writer.
+        exclude = ("private_key_encrypted", "csid_secret_encrypted")
+        read_only_fields = (
+            *AUDIT_FIELDS,
+            "compliance_csid",
+            "production_csid",
+            "certificate",
+            "compliance_request_id",
+            "status",
+            "onboarded_at",
+        )
 
 
 class ZatcaCounterSerializer(serializers.ModelSerializer):

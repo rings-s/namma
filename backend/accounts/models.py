@@ -1,15 +1,13 @@
-<<<<<<< HEAD
-from django.db import models
-
-# Create your models here.
-=======
-"""Accounts: custom user model and per-organization roles."""
+"""Accounts: custom user model, per-organization roles and TOTP 2FA."""
 
 import uuid
 
+import pyotp
+from django.conf import settings
 from django.contrib.auth.base_user import AbstractBaseUser, BaseUserManager
 from django.contrib.auth.models import PermissionsMixin
 from django.db import models
+from django.utils import timezone
 
 from core.models import BaseModel
 
@@ -87,12 +85,12 @@ class UserRole(BaseModel):
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="roles")
     role = models.CharField(max_length=20, choices=Role.choices)
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="user_roles",
     )
     branch = models.ForeignKey(
-        "organnizations.Branch",
+        "organizations.Branch",
         on_delete=models.CASCADE,
         related_name="user_roles",
         null=True,
@@ -112,4 +110,61 @@ class UserRole(BaseModel):
 
     def __str__(self):
         return f"{self.user} as {self.get_role_display()} @ {self.organization}"
->>>>>>> a3235b4 (feat(db): initialize core relational schema)
+
+
+class UserSession(BaseModel):
+    """One refresh-token lineage: created at login, its jti re-pointed on
+    every rotation, ended by logout/revocation. Powers the active-session
+    dashboard and remote sign-out."""
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="sessions")
+    refresh_jti = models.CharField(max_length=64, unique=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.CharField(max_length=512, blank=True)
+    device_label = models.CharField(max_length=255, blank=True)
+    last_seen_at = models.DateTimeField(default=timezone.now)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-last_seen_at"]
+        indexes = [
+            models.Index(fields=["user", "revoked_at"]),
+        ]
+
+    def __str__(self):
+        state = "revoked" if self.revoked_at else "active"
+        return f"Session for {self.user} ({state})"
+
+
+class TwoFactorDevice(BaseModel):
+    """TOTP device for a user. 2FA is enforced at login once ``confirmed``."""
+
+    user = models.OneToOneField(
+        User, on_delete=models.CASCADE, related_name="two_factor_device"
+    )
+    secret = models.CharField(max_length=64, editable=False)
+    confirmed = models.BooleanField(default=False)
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        state = "confirmed" if self.confirmed else "pending"
+        return f"2FA device for {self.user} ({state})"
+
+    @classmethod
+    def generate_secret(cls):
+        return pyotp.random_base32()
+
+    def verify(self, code):
+        # valid_window=1 tolerates one 30s step of clock drift either side.
+        return pyotp.TOTP(self.secret).verify(code, valid_window=1)
+
+    def provisioning_uri(self):
+        issuer = getattr(settings, "TWO_FACTOR_ISSUER", "Namaa")
+        return pyotp.TOTP(self.secret).provisioning_uri(
+            name=self.user.email, issuer_name=issuer
+        )
+
+    def confirm(self):
+        self.confirmed = True
+        self.confirmed_at = timezone.now()
+        self.save(update_fields=["confirmed", "confirmed_at", "updated_at"])

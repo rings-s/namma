@@ -1,8 +1,3 @@
-<<<<<<< HEAD
-from django.db import models
-
-# Create your models here.
-=======
 """Communications: message templates, dispatches, consent and notifications."""
 
 from django.conf import settings
@@ -19,13 +14,14 @@ class MessageTemplate(BaseModel):
         REJECTED = "rejected", "Rejected"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="message_templates",
     )
     name = models.CharField(max_length=255)
     channel = models.CharField(max_length=20, choices=Channel.choices)
     template_id_external = models.CharField(max_length=255, blank=True)
+    subject = models.CharField(max_length=255, blank=True)
     content = models.TextField()
     variables = models.JSONField(default=list, blank=True)
     approval_status = models.CharField(
@@ -49,7 +45,7 @@ class MessageDispatch(BaseModel):
         FAILED = "failed", "Failed"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="message_dispatches",
     )
@@ -67,8 +63,16 @@ class MessageDispatch(BaseModel):
         null=True,
         blank=True,
     )
+    campaign_recipient = models.ForeignKey(
+        "marketing.CampaignRecipient",
+        on_delete=models.SET_NULL,
+        related_name="dispatches",
+        null=True,
+        blank=True,
+    )
     channel = models.CharField(max_length=20, choices=Channel.choices)
     recipient = models.CharField(max_length=255)
+    subject = models.CharField(max_length=255, blank=True)
     content = models.TextField(blank=True)
     status = models.CharField(
         max_length=20, choices=Status.choices, default=Status.QUEUED
@@ -93,6 +97,55 @@ class MessageDispatch(BaseModel):
         return f"{self.get_channel_display()} to {self.recipient} ({self.get_status_display()})"
 
 
+class EmailEvent(BaseModel):
+    """One SES delivery event (via SNS), stored idempotently on the SNS id.
+
+    Written exclusively by the SES webhook receiver; a worker applies the
+    event to the matching dispatch (and its campaign recipient), so the
+    receiver itself never touches the messaging domain.
+    """
+
+    class ProcessingStatus(models.TextChoices):
+        PENDING = "pending", "Pending"
+        PROCESSED = "processed", "Processed"
+        IGNORED = "ignored", "Ignored"
+        FAILED = "failed", "Failed"
+
+    organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.CASCADE,
+        related_name="email_events",
+        null=True,
+        blank=True,
+    )
+    dispatch = models.ForeignKey(
+        MessageDispatch,
+        on_delete=models.SET_NULL,
+        related_name="email_events",
+        null=True,
+        blank=True,
+    )
+    sns_message_id = models.CharField(max_length=255, unique=True)
+    event_type = models.CharField(max_length=50)
+    ses_message_id = models.CharField(max_length=255, blank=True)
+    payload = models.JSONField(default=dict, blank=True)
+    processing_status = models.CharField(
+        max_length=20,
+        choices=ProcessingStatus.choices,
+        default=ProcessingStatus.PENDING,
+    )
+    processed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["ses_message_id"]),
+        ]
+
+    def __str__(self):
+        return f"{self.event_type}:{self.sns_message_id}"
+
+
 class ConsentRecord(BaseModel):
     class Purpose(models.TextChoices):
         MARKETING = "marketing", "Marketing"
@@ -100,7 +153,7 @@ class ConsentRecord(BaseModel):
         TRANSACTIONAL = "transactional", "Transactional"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="consent_records",
     )
@@ -135,7 +188,7 @@ class Notification(BaseModel):
         ALERT = "alert", "Alert"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="notifications",
     )
@@ -178,7 +231,7 @@ class Notification(BaseModel):
 
 class NotificationTemplate(BaseModel):
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="notification_templates",
     )
@@ -195,4 +248,100 @@ class NotificationTemplate(BaseModel):
 
     def __str__(self):
         return f"{self.name} ({self.get_channel_display()})"
->>>>>>> a3235b4 (feat(db): initialize core relational schema)
+
+
+# ---------------------------------------------------------------------------
+# Unified conversation inbox
+# ---------------------------------------------------------------------------
+
+
+class Conversation(BaseModel):
+    """One customer thread per channel in the omni-channel inbox, routable
+    to branch staff with an explicit status workflow."""
+
+    class Status(models.TextChoices):
+        OPEN = "open", "Open"
+        ASSIGNED = "assigned", "Assigned"
+        RESOLVED = "resolved", "Resolved"
+        CLOSED = "closed", "Closed"
+
+    organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.CASCADE,
+        related_name="conversations",
+    )
+    branch = models.ForeignKey(
+        "organizations.Branch",
+        on_delete=models.SET_NULL,
+        related_name="conversations",
+        null=True,
+        blank=True,
+    )
+    customer = models.ForeignKey(
+        "customers.Customer",
+        on_delete=models.CASCADE,
+        related_name="conversations",
+    )
+    channel = models.CharField(max_length=20, choices=Channel.choices)
+    subject = models.CharField(max_length=255, blank=True)
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.OPEN
+    )
+    assigned_to = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="assigned_conversations",
+        null=True,
+        blank=True,
+    )
+    last_message_at = models.DateTimeField(null=True, blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-last_message_at", "-created_at"]
+        indexes = [
+            models.Index(fields=["organization", "status"]),
+            models.Index(fields=["assigned_to", "status"]),
+        ]
+
+    def __str__(self):
+        return f"{self.get_channel_display()} thread with {self.customer}"
+
+
+class ConversationMessage(BaseModel):
+    class Direction(models.TextChoices):
+        INBOUND = "inbound", "Inbound"
+        OUTBOUND = "outbound", "Outbound"
+
+    conversation = models.ForeignKey(
+        Conversation, on_delete=models.CASCADE, related_name="messages"
+    )
+    direction = models.CharField(max_length=10, choices=Direction.choices)
+    body = models.TextField()
+    #: Outbound messages sent through a gateway link back to their dispatch
+    #: for delivery/cost tracking; inbound and internal notes stay null.
+    dispatch = models.ForeignKey(
+        MessageDispatch,
+        on_delete=models.SET_NULL,
+        related_name="conversation_messages",
+        null=True,
+        blank=True,
+    )
+    sender_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="conversation_messages",
+        null=True,
+        blank=True,
+    )
+    attachments = models.JSONField(default=list, blank=True)
+    read_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["created_at"]
+        indexes = [
+            models.Index(fields=["conversation", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.get_direction_display()} message in {self.conversation}"

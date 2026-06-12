@@ -1,8 +1,3 @@
-<<<<<<< HEAD
-from django.shortcuts import render
-
-# Create your views here.
-=======
 from ai import serializers
 from ai.models import AIConversation, AIMessage, AIRecommendation
 from core.api import TenantScopedViewSet
@@ -29,4 +24,3 @@ class AIRecommendationViewSet(TenantScopedViewSet):
     queryset = AIRecommendation.objects.all()
     serializer_class = serializers.AIRecommendationSerializer
     ordering_fields = ["created_at"]
->>>>>>> a3235b4 (feat(db): initialize core relational schema)

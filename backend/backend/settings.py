@@ -10,130 +10,242 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
-<<<<<<< HEAD
-=======
 import os
->>>>>>> a3235b4 (feat(db): initialize core relational schema)
+from datetime import timedelta
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Populate os.environ from backend/.env before any setting reads it.
+# Real environment variables win over .env values (override=False).
+load_dotenv(BASE_DIR / ".env")
 
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-<<<<<<< HEAD
-SECRET_KEY = 'django-insecure-gk_oxvr$4a007n*l$1z*9*=t#a)nw@dd)9)+k$(c9gc$#=)k=l'
-
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
-
-ALLOWED_HOSTS = []
-=======
 SECRET_KEY = os.environ.get(
-    'DJANGO_SECRET_KEY',
-    'django-insecure-gk_oxvr$4a007n*l$1z*9*=t#a)nw@dd)9)+k$(c9gc$#=)k=l',
+    "DJANGO_SECRET_KEY",
+    "django-insecure-gk_oxvr$4a007n*l$1z*9*=t#a)nw@dd)9)+k$(c9gc$#=)k=l",
 )
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.environ.get('DJANGO_DEBUG', 'true').lower() in ('1', 'true', 'yes')
+DEBUG = os.environ.get("DJANGO_DEBUG", "true").lower() in ("1", "true", "yes")
 
 ALLOWED_HOSTS = [
     host.strip()
-    for host in os.environ.get('DJANGO_ALLOWED_HOSTS', '').split(',')
+    for host in os.environ.get("DJANGO_ALLOWED_HOSTS", "").split(",")
     if host.strip()
 ]
->>>>>>> a3235b4 (feat(db): initialize core relational schema)
 
 
 # Application definition
 
 INSTALLED_APPS = [
-    'django.contrib.admin',
-    'django.contrib.auth',
-    'django.contrib.contenttypes',
-    'django.contrib.sessions',
-    'django.contrib.messages',
-    'django.contrib.staticfiles',
-<<<<<<< HEAD
-]
-
-=======
+    "django.contrib.admin",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
     # Third-party
-    'rest_framework',
+    "rest_framework",
+    "rest_framework_simplejwt",
+    "rest_framework_simplejwt.token_blacklist",
     # Namaa apps
-    'core',
-    'accounts',
-    'organnizations',
-    'customers',
-    'commerce',
-    'inventory',
-    'operations',
-    'financials',
-    'marketing',
-    'communications',
-    'analytics',
-    'ai',
-    'integrations',
+    "core",
+    "accounts",
+    "organizations",
+    "customers",
+    "commerce",
+    "inventory",
+    "operations",
+    "financials",
+    "marketing",
+    "communications",
+    "analytics",
+    "ai",
+    "integrations",
 ]
 
-AUTH_USER_MODEL = 'accounts.User'
+AUTH_USER_MODEL = "accounts.User"
 
 REST_FRAMEWORK = {
-    'DEFAULT_AUTHENTICATION_CLASSES': [
-        'rest_framework.authentication.SessionAuthentication',
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
+        "rest_framework.authentication.SessionAuthentication",
     ],
-    'DEFAULT_PERMISSION_CLASSES': [
-        'rest_framework.permissions.IsAuthenticated',
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.IsAuthenticated",
     ],
-    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
-    'PAGE_SIZE': 50,
-    'DEFAULT_FILTER_BACKENDS': [
-        'rest_framework.filters.SearchFilter',
-        'rest_framework.filters.OrderingFilter',
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "PAGE_SIZE": 50,
+    "DEFAULT_FILTER_BACKENDS": [
+        "rest_framework.filters.SearchFilter",
+        "rest_framework.filters.OrderingFilter",
     ],
+    # Platform-wide rate limits (per-view overrides tighten these further).
+    # Backed by the cache: point CACHES at Redis in production so limits
+    # hold across workers.
+    "DEFAULT_THROTTLE_CLASSES": [
+        "rest_framework.throttling.AnonRateThrottle",
+        "rest_framework.throttling.UserRateThrottle",
+    ],
+    "DEFAULT_THROTTLE_RATES": {
+        # Dev/test default is effectively unlimited; production deployments
+        # set DJANGO_DEBUG=false and get the real limits.
+        "anon": os.environ.get("API_THROTTLE_ANON", "60/min"),
+        "user": os.environ.get("API_THROTTLE_USER", "600/min"),
+    },
 }
 
->>>>>>> a3235b4 (feat(db): initialize core relational schema)
+if DEBUG:  # local runs and the test suite share one client IP
+    REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"] = {
+        "anon": "10000/min",
+        "user": "10000/min",
+    }
+
+# JWT auth (djangorestframework-simplejwt). Lifetimes/keys come from env in
+# production; the defaults below are development values.
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(
+        minutes=int(os.environ.get("JWT_ACCESS_TOKEN_MINUTES", "30"))
+    ),
+    "REFRESH_TOKEN_LIFETIME": timedelta(
+        days=int(os.environ.get("JWT_REFRESH_TOKEN_DAYS", "7"))
+    ),
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
+    "UPDATE_LAST_LOGIN": True,
+    "SIGNING_KEY": os.environ.get("JWT_SIGNING_KEY", SECRET_KEY),
+    "AUTH_HEADER_TYPES": ("Bearer",),
+}
+
+# Issuer label shown in authenticator apps for TOTP enrollment.
+TWO_FACTOR_ISSUER = os.environ.get("TWO_FACTOR_ISSUER", "Namaa")
+
+# Moyasar payment gateway (docs.moyasar.com). Secret values come from env;
+# the key is the HTTP Basic username with an empty password, HTTPS only.
+MOYASAR_API_BASE_URL = os.environ.get(
+    "MOYASAR_API_BASE_URL", "https://api.moyasar.com/v1"
+)
+MOYASAR_SECRET_KEY = os.environ.get("MOYASAR_SECRET_KEY", "")
+MOYASAR_WEBHOOK_SECRET = os.environ.get("MOYASAR_WEBHOOK_SECRET", "")
+
+# Taqnyat SMS gateway (taqnyat.sa, official OpenAPI spec). Bearer token from
+# the dashboard; sender must be a pre-approved sender name on the account.
+TAQNYAT_API_BASE_URL = os.environ.get("TAQNYAT_API_BASE_URL", "https://api.taqnyat.sa")
+TAQNYAT_BEARER_TOKEN = os.environ.get("TAQNYAT_BEARER_TOKEN", "")
+TAQNYAT_SMS_SENDER = os.environ.get("TAQNYAT_SMS_SENDER", "")
+
+# Email via Amazon SES. Two paths share the same verified identity:
+# - Django framework mail (password resets, admin error reports) goes over
+#   the SES SMTP interface using the EMAIL_* settings below.
+# - Customer-facing dispatches and marketing campaigns go through the SES v2
+#   API (communications.gateways.SESEmailClient) so sends are tagged, tracked
+#   through a configuration set and reconciled by the SNS event webhook.
+# Dev default is the console backend; point DJANGO_EMAIL_BACKEND at the SMTP
+# backend in production. SES SMTP credentials are NOT the IAM access keys.
+EMAIL_BACKEND = os.environ.get(
+    "DJANGO_EMAIL_BACKEND", "django.core.mail.backends.console.EmailBackend"
+)
+EMAIL_HOST = os.environ.get("EMAIL_HOST", "email-smtp.me-south-1.amazonaws.com")
+EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "587"))
+EMAIL_USE_TLS = os.environ.get("EMAIL_USE_TLS", "true").lower() in ("1", "true", "yes")
+EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "")
+EMAIL_TIMEOUT = int(os.environ.get("EMAIL_TIMEOUT", "10"))
+DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "Namaa <no-reply@namaa.sa>")
+SERVER_EMAIL = os.environ.get("SERVER_EMAIL", DEFAULT_FROM_EMAIL)
+
+# SES v2 API (me-south-1 = Bahrain, the closest region to KSA). Keys may be
+# blank on AWS-hosted runtimes where boto3 resolves an instance role instead.
+# The configuration set must have an SNS event destination subscribed to
+# /api/v1/webhooks/ses/ for delivery tracking; the webhook authenticates
+# every envelope against the AWS SNS message signature.
+AWS_SES_REGION = os.environ.get("AWS_SES_REGION", "me-south-1")
+AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+AWS_SES_CONFIGURATION_SET = os.environ.get("AWS_SES_CONFIGURATION_SET", "")
+# Exact ARN of the SNS topic carrying SES events. The webhook rejects every
+# envelope from any other topic (a valid AWS signature alone is not enough —
+# anyone's own topic signs validly too). Blank = webhook fails closed.
+AWS_SES_SNS_TOPIC_ARN = os.environ.get("AWS_SES_SNS_TOPIC_ARN", "")
+SES_FROM_EMAIL = os.environ.get("SES_FROM_EMAIL", "no-reply@namaa.sa")
+
+# ZATCA Fatoora e-invoicing (Phase 2). ZATCA_ENVIRONMENT picks the API base
+# URL and the CSR certificate template: "sandbox" (developer portal, test
+# CSIDs), "simulation" (real onboarding flow, no fiscal effect) or
+# "production". ZATCA_KEY_ENCRYPTION_KEY is a Fernet key encrypting device
+# private keys and CSID secrets at rest — generate one with
+# python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+ZATCA_ENVIRONMENT = os.environ.get("ZATCA_ENVIRONMENT", "sandbox")
+_ZATCA_BASE_URLS = {
+    "sandbox": "https://gw-fatoora.zatca.gov.sa/e-invoicing/developer-portal",
+    "simulation": "https://gw-fatoora.zatca.gov.sa/e-invoicing/simulation",
+    "production": "https://gw-fatoora.zatca.gov.sa/e-invoicing/core",
+}
+ZATCA_API_BASE_URL = os.environ.get(
+    "ZATCA_API_BASE_URL",
+    _ZATCA_BASE_URLS.get(ZATCA_ENVIRONMENT, _ZATCA_BASE_URLS["sandbox"]),
+)
+ZATCA_KEY_ENCRYPTION_KEY = os.environ.get("ZATCA_KEY_ENCRYPTION_KEY", "")
+
+# Celery (settings consumed via config_from_object namespace="CELERY").
+# Redis is both broker and result backend; gateway calls and webhook
+# processing run on workers so requests never block on third parties.
+CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")
+CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", CELERY_BROKER_URL)
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TIMEZONE = "UTC"
+CELERY_TASK_ALWAYS_EAGER = os.environ.get(
+    "CELERY_TASK_ALWAYS_EAGER", "false"
+).lower() in ("1", "true", "yes")
+CELERY_TASK_EAGER_PROPAGATES = True
+
 MIDDLEWARE = [
-    'django.middleware.security.SecurityMiddleware',
-    'django.contrib.sessions.middleware.SessionMiddleware',
-    'django.middleware.common.CommonMiddleware',
-    'django.middleware.csrf.CsrfViewMiddleware',
-    'django.contrib.auth.middleware.AuthenticationMiddleware',
-    'django.contrib.messages.middleware.MessageMiddleware',
-    'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    "django.middleware.security.SecurityMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
-ROOT_URLCONF = 'backend.urls'
+ROOT_URLCONF = "backend.urls"
 
 TEMPLATES = [
     {
-        'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
-        'APP_DIRS': True,
-        'OPTIONS': {
-            'context_processors': [
-                'django.template.context_processors.request',
-                'django.contrib.auth.context_processors.auth',
-                'django.contrib.messages.context_processors.messages',
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [],
+        "APP_DIRS": True,
+        "OPTIONS": {
+            "context_processors": [
+                "django.template.context_processors.request",
+                "django.contrib.auth.context_processors.auth",
+                "django.contrib.messages.context_processors.messages",
             ],
         },
     },
 ]
 
-WSGI_APPLICATION = 'backend.wsgi.application'
+WSGI_APPLICATION = "backend.wsgi.application"
 
 
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
 DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+    "default": {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": BASE_DIR / "db.sqlite3",
     }
 }
 
@@ -143,16 +255,16 @@ DATABASES = {
 
 AUTH_PASSWORD_VALIDATORS = [
     {
-        'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
+        "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator",
     },
     {
-        'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
+        "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
     },
     {
-        'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',
+        "NAME": "django.contrib.auth.password_validation.CommonPasswordValidator",
     },
     {
-        'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
+        "NAME": "django.contrib.auth.password_validation.NumericPasswordValidator",
     },
 ]
 
@@ -160,9 +272,9 @@ AUTH_PASSWORD_VALIDATORS = [
 # Internationalization
 # https://docs.djangoproject.com/en/6.0/topics/i18n/
 
-LANGUAGE_CODE = 'en-us'
+LANGUAGE_CODE = "en-us"
 
-TIME_ZONE = 'UTC'
+TIME_ZONE = "UTC"
 
 USE_I18N = True
 
@@ -172,4 +284,4 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
-STATIC_URL = 'static/'
+STATIC_URL = "static/"

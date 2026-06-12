@@ -1,11 +1,29 @@
-<<<<<<< HEAD
-from django.shortcuts import render
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.utils import timezone
+from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError
+from rest_framework.response import Response
 
-# Create your views here.
-=======
-from core.api import TenantScopedViewSet
-from inventory.models import StockMovement, StockTransfer
-from inventory.serializers import StockMovementSerializer, StockTransferSerializer
+from accounts.models import UserRole
+from core.api import TenantScopedViewSet, require_org_role
+from inventory.models import (
+    PurchaseOrder,
+    PurchaseOrderLine,
+    ReorderRule,
+    StockMovement,
+    StockTransfer,
+    Supplier,
+)
+from inventory.serializers import (
+    PurchaseOrderLineSerializer,
+    PurchaseOrderReceiptSerializer,
+    PurchaseOrderSerializer,
+    ReorderRuleSerializer,
+    StockMovementSerializer,
+    StockTransferSerializer,
+    SupplierSerializer,
+)
+from inventory.services import low_stock_products, receive_purchase_order_lines
 
 
 class StockMovementViewSet(TenantScopedViewSet):
@@ -17,7 +35,85 @@ class StockMovementViewSet(TenantScopedViewSet):
 
 
 class StockTransferViewSet(TenantScopedViewSet):
-    queryset = StockTransfer.objects.select_related("product", "from_branch", "to_branch")
+    queryset = StockTransfer.objects.select_related(
+        "product", "from_branch", "to_branch"
+    )
     serializer_class = StockTransferSerializer
     ordering_fields = ["created_at"]
->>>>>>> a3235b4 (feat(db): initialize core relational schema)
+
+
+class SupplierViewSet(TenantScopedViewSet):
+    queryset = Supplier.objects.all()
+    serializer_class = SupplierSerializer
+    search_fields = ["name", "contact_name", "email"]
+
+
+class PurchaseOrderViewSet(TenantScopedViewSet):
+    queryset = PurchaseOrder.objects.select_related(
+        "supplier", "branch"
+    ).prefetch_related("lines__product")
+    serializer_class = PurchaseOrderSerializer
+    search_fields = ["po_number"]
+    ordering_fields = ["created_at", "expected_at"]
+
+    @action(detail=True, methods=["post"])
+    def submit(self, request, pk=None):
+        """Move a draft order to the supplier (draft -> submitted)."""
+        purchase_order = self.get_object()
+        require_org_role(
+            request.user, purchase_order.organization_id, UserRole.Role.MANAGER
+        )
+        if purchase_order.status != PurchaseOrder.Status.DRAFT:
+            raise ValidationError("Only draft purchase orders can be submitted.")
+        if not purchase_order.lines.exists():
+            raise ValidationError("A purchase order needs at least one line.")
+        purchase_order.status = PurchaseOrder.Status.SUBMITTED
+        purchase_order.submitted_at = timezone.now()
+        purchase_order.save(update_fields=["status", "submitted_at", "updated_at"])
+        return Response(self.get_serializer(purchase_order).data)
+
+    @action(detail=True, methods=["post"])
+    def receive(self, request, pk=None):
+        """Record a (partial) delivery: appends stock movements and
+        advances the order state. Manager+."""
+        purchase_order = self.get_object()
+        require_org_role(
+            request.user, purchase_order.organization_id, UserRole.Role.MANAGER
+        )
+        params = PurchaseOrderReceiptSerializer(data=request.data)
+        params.is_valid(raise_exception=True)
+        try:
+            purchase_order = receive_purchase_order_lines(
+                purchase_order,
+                params.validated_data["receipts"],
+                received_by=request.user,
+            )
+        except DjangoValidationError as exc:
+            raise ValidationError(exc.messages)
+        return Response(self.get_serializer(purchase_order).data)
+
+
+class PurchaseOrderLineViewSet(TenantScopedViewSet):
+    queryset = PurchaseOrderLine.objects.select_related("purchase_order", "product")
+    serializer_class = PurchaseOrderLineSerializer
+    org_field = "purchase_order__organization"
+
+
+class ReorderRuleViewSet(TenantScopedViewSet):
+    queryset = ReorderRule.objects.select_related(
+        "product", "branch", "preferred_supplier"
+    )
+    serializer_class = ReorderRuleSerializer
+
+    @action(detail=False, methods=["get"], url_path="low-stock")
+    def low_stock(self, request):
+        """Products at/below their reorder point. ?organization=<id> when
+        the user belongs to several organizations."""
+        organization_id = request.query_params.get("organization")
+        if not organization_id:
+            org_ids = self.allowed_organization_ids()
+            if org_ids is None or len(org_ids) != 1:
+                return Response({"detail": "Pass ?organization=<id>."}, status=400)
+            organization_id = org_ids[0]
+        require_org_role(request.user, organization_id, UserRole.Role.STAFF)
+        return Response(low_stock_products(organization_id))

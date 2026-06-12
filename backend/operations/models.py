@@ -1,13 +1,9 @@
-<<<<<<< HEAD
-from django.db import models
-
-# Create your models here.
-=======
 """Operations: staff, scheduling, appointments, bookings, events,
 tickets, resources, queueing and payroll."""
 
-from django.conf import settings
 from django.db import models
+
+from django.conf import settings
 from django.utils import timezone
 
 from core.models import BaseModel, Channel, Weekday
@@ -16,6 +12,7 @@ from core.models import BaseModel, Channel, Weekday
 # ---------------------------------------------------------------------------
 # Employees
 # ---------------------------------------------------------------------------
+
 
 class Employee(BaseModel):
     user = models.ForeignKey(
@@ -26,12 +23,12 @@ class Employee(BaseModel):
         blank=True,
     )
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="employees",
     )
     branch = models.ForeignKey(
-        "organnizations.Branch",
+        "organizations.Branch",
         on_delete=models.SET_NULL,
         related_name="employees",
         null=True,
@@ -41,6 +38,10 @@ class Employee(BaseModel):
     job_title = models.CharField(max_length=150, blank=True)
     department = models.CharField(max_length=150, blank=True)
     hire_date = models.DateField(null=True, blank=True)
+    # Saudi labor compliance: Nitaqat saudization ratios and GOSI brackets
+    # both hinge on nationality; the monthly salary anchors loaded-cost math.
+    is_saudi = models.BooleanField(default=False)
+    monthly_salary = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     hourly_rate = models.DecimalField(
         max_digits=12, decimal_places=2, null=True, blank=True
     )
@@ -114,7 +115,7 @@ class EmployeeShift(BaseModel):
         Employee, on_delete=models.CASCADE, related_name="shifts"
     )
     branch = models.ForeignKey(
-        "organnizations.Branch",
+        "organizations.Branch",
         on_delete=models.CASCADE,
         related_name="employee_shifts",
     )
@@ -138,6 +139,7 @@ class EmployeeShift(BaseModel):
 # Recurrence & events
 # ---------------------------------------------------------------------------
 
+
 class RecurrenceRule(BaseModel):
     class Frequency(models.TextChoices):
         DAILY = "daily", "Daily"
@@ -146,7 +148,7 @@ class RecurrenceRule(BaseModel):
         YEARLY = "yearly", "Yearly"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="recurrence_rules",
     )
@@ -170,12 +172,12 @@ class Event(BaseModel):
         OTHER = "other", "Other"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="events",
     )
     branch = models.ForeignKey(
-        "organnizations.Branch",
+        "organizations.Branch",
         on_delete=models.SET_NULL,
         related_name="events",
         null=True,
@@ -214,6 +216,7 @@ class Event(BaseModel):
 # Appointments
 # ---------------------------------------------------------------------------
 
+
 class Appointment(BaseModel):
     class Status(models.TextChoices):
         SCHEDULED = "scheduled", "Scheduled"
@@ -230,12 +233,12 @@ class Appointment(BaseModel):
         STAFF = "staff", "Staff"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="appointments",
     )
     branch = models.ForeignKey(
-        "organnizations.Branch",
+        "organizations.Branch",
         on_delete=models.CASCADE,
         related_name="appointments",
     )
@@ -315,6 +318,7 @@ class AppointmentReminder(BaseModel):
 # Bookings
 # ---------------------------------------------------------------------------
 
+
 class Booking(BaseModel):
     class BookingType(models.TextChoices):
         SERVICE = "service", "Service"
@@ -330,12 +334,12 @@ class Booking(BaseModel):
         NO_SHOW = "no_show", "No Show"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="bookings",
     )
     branch = models.ForeignKey(
-        "organnizations.Branch",
+        "organizations.Branch",
         on_delete=models.CASCADE,
         related_name="bookings",
     )
@@ -417,7 +421,7 @@ class BookingDeposit(BaseModel):
         REFUNDED = "refunded", "Refunded"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="booking_deposits",
     )
@@ -446,9 +450,10 @@ class BookingDeposit(BaseModel):
 # Tickets
 # ---------------------------------------------------------------------------
 
+
 class TicketType(BaseModel):
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="ticket_types",
     )
@@ -477,12 +482,12 @@ class Ticket(BaseModel):
         CANCELLED = "cancelled", "Cancelled"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="tickets",
     )
     branch = models.ForeignKey(
-        "organnizations.Branch",
+        "organizations.Branch",
         on_delete=models.SET_NULL,
         related_name="tickets",
         null=True,
@@ -564,6 +569,7 @@ class TicketVerification(BaseModel):
 # Resources, slot holds, policies, queue
 # ---------------------------------------------------------------------------
 
+
 class Resource(BaseModel):
     class ResourceType(models.TextChoices):
         ROOM = "room", "Room"
@@ -573,12 +579,12 @@ class Resource(BaseModel):
         OTHER = "other", "Other"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="resources",
     )
     branch = models.ForeignKey(
-        "organnizations.Branch",
+        "organizations.Branch",
         on_delete=models.SET_NULL,
         related_name="resources",
         null=True,
@@ -612,12 +618,12 @@ class ResourceSchedule(BaseModel):
 
 class SlotHold(BaseModel):
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="slot_holds",
     )
     branch = models.ForeignKey(
-        "organnizations.Branch",
+        "organizations.Branch",
         on_delete=models.CASCADE,
         related_name="slot_holds",
     )
@@ -657,12 +663,12 @@ class CancellationPolicy(BaseModel):
         PERCENT = "percent", "Percentage"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="cancellation_policies",
     )
     branch = models.ForeignKey(
-        "organnizations.Branch",
+        "organizations.Branch",
         on_delete=models.CASCADE,
         related_name="cancellation_policies",
         null=True,
@@ -684,9 +690,7 @@ class CancellationPolicy(BaseModel):
     no_show_fee_type = models.CharField(
         max_length=10, choices=FeeType.choices, default=FeeType.NONE
     )
-    no_show_fee_value = models.DecimalField(
-        max_digits=12, decimal_places=2, default=0
-    )
+    no_show_fee_value = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     is_refundable = models.BooleanField(default=True)
 
     class Meta:
@@ -705,12 +709,12 @@ class QueueTicket(BaseModel):
         ABANDONED = "abandoned", "Abandoned"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="queue_tickets",
     )
     branch = models.ForeignKey(
-        "organnizations.Branch",
+        "organizations.Branch",
         on_delete=models.CASCADE,
         related_name="queue_tickets",
     )
@@ -752,6 +756,7 @@ class QueueTicket(BaseModel):
 # Payroll & commissions
 # ---------------------------------------------------------------------------
 
+
 class PayrollPeriod(BaseModel):
     class Status(models.TextChoices):
         OPEN = "open", "Open"
@@ -760,7 +765,7 @@ class PayrollPeriod(BaseModel):
         PAID = "paid", "Paid"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="payroll_periods",
     )
@@ -793,7 +798,7 @@ class CommissionEntry(BaseModel):
         ADJUSTMENT = "adjustment", "Adjustment"
 
     organization = models.ForeignKey(
-        "organnizations.Organization",
+        "organizations.Organization",
         on_delete=models.CASCADE,
         related_name="commission_entries",
     )
@@ -830,4 +835,188 @@ class CommissionEntry(BaseModel):
 
     def __str__(self):
         return f"{self.get_entry_type_display()} {self.amount} for {self.employee}"
->>>>>>> a3235b4 (feat(db): initialize core relational schema)
+
+
+class CommissionRule(BaseModel):
+    """Configurable commission scheme. The calculator picks the most
+    specific active rule per sale item (employee+service > employee >
+    service/product > org default) and writes immutable CommissionEntry
+    rows; Employee.commission_rate stays as the legacy flat fallback."""
+
+    class Basis(models.TextChoices):
+        PERCENT = "percent", "Percentage of line total"
+        FIXED = "fixed", "Fixed amount per item"
+        TIERED = "tiered", "Tiered percentage by period revenue"
+
+    class AppliesTo(models.TextChoices):
+        SERVICES = "services", "Services"
+        PRODUCTS = "products", "Products"
+        ALL = "all", "Services & Products"
+
+    organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.CASCADE,
+        related_name="commission_rules",
+    )
+    branch = models.ForeignKey(
+        "organizations.Branch",
+        on_delete=models.CASCADE,
+        related_name="commission_rules",
+        null=True,
+        blank=True,
+    )
+    employee = models.ForeignKey(
+        Employee,
+        on_delete=models.CASCADE,
+        related_name="commission_rules",
+        null=True,
+        blank=True,
+    )
+    service = models.ForeignKey(
+        "commerce.Service",
+        on_delete=models.CASCADE,
+        related_name="commission_rules",
+        null=True,
+        blank=True,
+    )
+    product = models.ForeignKey(
+        "commerce.Product",
+        on_delete=models.CASCADE,
+        related_name="commission_rules",
+        null=True,
+        blank=True,
+    )
+    name = models.CharField(max_length=255)
+    basis = models.CharField(max_length=10, choices=Basis.choices)
+    rate_percent = models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True
+    )
+    fixed_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+    #: Tiered basis: [{"threshold": "0", "rate_percent": "5"},
+    #: {"threshold": "20000", "rate_percent": "8"}] — the highest threshold
+    #: not exceeding the employee's period revenue wins.
+    tiers = models.JSONField(default=list, blank=True)
+    applies_to = models.CharField(
+        max_length=10, choices=AppliesTo.choices, default=AppliesTo.ALL
+    )
+    priority = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["-priority", "name"]
+        indexes = [
+            models.Index(fields=["organization", "is_active"]),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class EmployeeCostComponent(BaseModel):
+    """One recurring monthly component of an employee's fully loaded cost
+    (Saudi Labor Optimization Cost Engine). Components are effective-dated,
+    never edited in place for past periods — close one and open the next —
+    so historical margin reports stay truthful."""
+
+    class ComponentType(models.TextChoices):
+        BASE_SALARY = "base_salary", "Base Salary"
+        GOSI_EMPLOYER = "gosi_employer", "GOSI (Employer Share)"
+        QIWA_VISA = "qiwa_visa", "Qiwa/Visa Amortization"
+        MEDICAL_INSURANCE = "medical_insurance", "Medical Insurance"
+        HOUSING = "housing", "Housing Allowance"
+        TRANSPORT = "transport", "Transport Allowance"
+        OTHER = "other", "Other"
+
+    organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.CASCADE,
+        related_name="employee_cost_components",
+    )
+    employee = models.ForeignKey(
+        Employee, on_delete=models.CASCADE, related_name="cost_components"
+    )
+    component_type = models.CharField(max_length=30, choices=ComponentType.choices)
+    monthly_amount = models.DecimalField(max_digits=12, decimal_places=2)
+    effective_from = models.DateField()
+    effective_to = models.DateField(null=True, blank=True)
+    notes = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        ordering = ["-effective_from"]
+        indexes = [
+            models.Index(fields=["employee", "effective_from"]),
+        ]
+
+    def __str__(self):
+        return f"{self.get_component_type_display()} {self.monthly_amount} for {self.employee}"
+
+
+class WaitlistEntry(BaseModel):
+    """A customer waiting for a slot. Offers expire so high-priority
+    customers cannot deadlock the list."""
+
+    class Status(models.TextChoices):
+        WAITING = "waiting", "Waiting"
+        OFFERED = "offered", "Offered"
+        BOOKED = "booked", "Booked"
+        EXPIRED = "expired", "Expired"
+        CANCELLED = "cancelled", "Cancelled"
+
+    organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.CASCADE,
+        related_name="waitlist_entries",
+    )
+    branch = models.ForeignKey(
+        "organizations.Branch",
+        on_delete=models.CASCADE,
+        related_name="waitlist_entries",
+    )
+    customer = models.ForeignKey(
+        "customers.Customer",
+        on_delete=models.CASCADE,
+        related_name="waitlist_entries",
+    )
+    service = models.ForeignKey(
+        "commerce.Service",
+        on_delete=models.CASCADE,
+        related_name="waitlist_entries",
+    )
+    preferred_employee = models.ForeignKey(
+        Employee,
+        on_delete=models.SET_NULL,
+        related_name="waitlist_entries",
+        null=True,
+        blank=True,
+    )
+    desired_from = models.DateTimeField()
+    desired_until = models.DateTimeField()
+    #: Higher = served first; VIP/high-LTV segments get boosted here.
+    priority = models.PositiveIntegerField(default=0)
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.WAITING
+    )
+    offered_at = models.DateTimeField(null=True, blank=True)
+    offer_expires_at = models.DateTimeField(null=True, blank=True)
+    booked_appointment = models.ForeignKey(
+        Appointment,
+        on_delete=models.SET_NULL,
+        related_name="waitlist_entries",
+        null=True,
+        blank=True,
+    )
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        verbose_name_plural = "waitlist entries"
+        ordering = ["-priority", "created_at"]
+        indexes = [
+            models.Index(fields=["branch", "status"]),
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.customer} waiting for {self.service} ({self.get_status_display()})"
+        )

@@ -22,4 +22,11 @@ class AIRecommendationSerializer(serializers.ModelSerializer):
     class Meta:
         model = AIRecommendation
         fields = "__all__"
-        read_only_fields = (*AUDIT_FIELDS, "type", "title", "description", "priority", "data")
+        read_only_fields = (
+            *AUDIT_FIELDS,
+            "type",
+            "title",
+            "description",
+            "priority",
+            "data",
+        )

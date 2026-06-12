@@ -8,5 +8,9 @@ router.register("campaign-recipients", views.CampaignRecipientViewSet)
 router.register("promotions", views.PromotionViewSet)
 router.register("loyalty-programs", views.LoyaltyProgramViewSet)
 router.register("loyalty-transactions", views.LoyaltyTransactionViewSet)
+router.register("referral-programs", views.ReferralProgramViewSet)
+router.register("referrals", views.ReferralViewSet)
+router.register("journeys", views.JourneyViewSet)
+router.register("journey-steps", views.JourneyStepViewSet)
 
 urlpatterns = router.urls

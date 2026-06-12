@@ -1,12 +1,32 @@
-<<<<<<< HEAD
-from django.shortcuts import render
+import hmac
 
-# Create your views here.
-=======
-from rest_framework import mixins, permissions, viewsets
+from django.conf import settings
+from django.core.exceptions import ValidationError as DjangoValidationError
+from rest_framework import generics, mixins, permissions, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError
+from rest_framework.response import Response
 
-from core.api import TenantScopedQuerysetMixin, TenantScopedReadOnlyViewSet, TenantScopedViewSet
+from accounts.models import UserRole
+from core.api import (
+    TenantScopedQuerysetMixin,
+    TenantScopedReadOnlyViewSet,
+    TenantScopedViewSet,
+    require_org_role,
+)
 from financials import serializers
+from financials.models import Gateway
+from financials.services import (
+    validate_e_invoice_generable,
+    validate_refund_executable,
+)
+from financials.tasks import (
+    activate_zatca_device_task,
+    execute_moyasar_refund_task,
+    generate_and_submit_e_invoice_task,
+    onboard_zatca_device_task,
+    process_payment_webhook_event_task,
+)
 from financials.models import (
     CreditNote,
     DebitNote,
@@ -44,6 +64,34 @@ class InvoiceViewSet(TenantScopedViewSet):
     search_fields = ["invoice_number"]
     ordering_fields = ["issued_at", "due_date", "total_amount", "created_at"]
 
+    @action(detail=True, methods=["post"], url_path="einvoice")
+    def einvoice(self, request, pk=None):
+        """Queue ZATCA e-invoice generation + submission. Accountant+ only.
+
+        Optional body: ``zatca_device`` (defaults to the organization's
+        active device) and ``invoice_type`` (defaults to simplified).
+        """
+        invoice = self.get_object()
+        require_org_role(
+            request.user, invoice.organization_id, UserRole.Role.ACCOUNTANT
+        )
+        device_id = request.data.get("zatca_device")
+        devices = ZatcaDevice.objects.filter(
+            organization_id=invoice.organization_id,
+            status=ZatcaDevice.Status.ACTIVE,
+        )
+        device = devices.filter(pk=device_id).first() if device_id else devices.first()
+        if device is None:
+            raise ValidationError(
+                "No active ZATCA device is available for this organization."
+            )
+        try:
+            validate_e_invoice_generable(invoice, device)
+        except DjangoValidationError as exc:
+            raise ValidationError(exc.messages)
+        generate_and_submit_e_invoice_task.delay(str(invoice.pk), str(device.pk))
+        return Response({"detail": "queued"}, status=status.HTTP_202_ACCEPTED)
+
 
 class CreditNoteViewSet(TenantScopedViewSet):
     queryset = CreditNote.objects.select_related("original_invoice")
@@ -72,6 +120,61 @@ class PaymentViewSet(TenantScopedViewSet):
 class RefundViewSet(TenantScopedViewSet):
     queryset = Refund.objects.select_related("payment", "approver")
     serializer_class = serializers.RefundSerializer
+
+    @action(detail=True, methods=["post"])
+    def execute(self, request, pk=None):
+        """Queue a pending refund for execution at Moyasar. Manager+ only."""
+        refund = self.get_object()
+        require_org_role(request.user, refund.organization_id, UserRole.Role.MANAGER)
+        try:
+            validate_refund_executable(refund)
+        except DjangoValidationError as exc:
+            raise ValidationError(exc.messages)
+        execute_moyasar_refund_task.delay(str(refund.pk), str(request.user.pk))
+        refund.refresh_from_db()
+        return Response(
+            serializers.RefundSerializer(refund).data, status=status.HTTP_202_ACCEPTED
+        )
+
+
+class MoyasarWebhookView(generics.GenericAPIView):
+    """Receiver for Moyasar webhook deliveries.
+
+    Validates the shared secret token (constant-time), stores the event
+    idempotently on its gateway event id, processes it locally, and always
+    answers 200 for stored events so Moyasar stops retrying.
+    """
+
+    authentication_classes = []
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        secret = settings.MOYASAR_WEBHOOK_SECRET
+        token = str(request.data.get("secret_token", ""))
+        if not secret or not hmac.compare_digest(token, secret):
+            return Response(
+                {"detail": "Invalid webhook token."}, status=status.HTTP_403_FORBIDDEN
+            )
+        event_id = request.data.get("id")
+        if not event_id:
+            return Response(
+                {"detail": "Missing event id."}, status=status.HTTP_400_BAD_REQUEST
+            )
+        payload = dict(request.data)
+        payload.pop("secret_token", None)  # never persist the shared secret
+        event, created = PaymentWebhookEvent.objects.get_or_create(
+            gateway_event_id=str(event_id),
+            defaults={
+                "gateway": Gateway.MOYASAR,
+                "event_type": str(request.data.get("type", "")),
+                "payload": payload,
+            },
+        )
+        if created:
+            # Store fast, return fast: a worker applies the event to the
+            # payment domain. The 200 stops Moyasar's retries either way.
+            process_payment_webhook_event_task.delay(str(event.pk))
+        return Response({"detail": "ok"})
 
 
 class PaymentWebhookEventViewSet(TenantScopedReadOnlyViewSet):
@@ -115,6 +218,35 @@ class LedgerEntryViewSet(
 class ZatcaDeviceViewSet(TenantScopedViewSet):
     queryset = ZatcaDevice.objects.select_related("branch")
     serializer_class = serializers.ZatcaDeviceSerializer
+
+    @action(detail=True, methods=["post"])
+    def onboard(self, request, pk=None):
+        """Exchange a Fatoora portal OTP for the compliance CSID. Admin+.
+
+        The OTP is forwarded to the worker and never persisted.
+        """
+        device = self.get_object()
+        require_org_role(request.user, device.organization_id, UserRole.Role.ADMIN)
+        otp = str(request.data.get("otp", "")).strip()
+        if not otp:
+            raise ValidationError("An OTP from the Fatoora portal is required.")
+        if device.status not in (
+            ZatcaDevice.Status.PENDING,
+            ZatcaDevice.Status.REVOKED,
+        ):
+            raise ValidationError("This device has already been onboarded.")
+        onboard_zatca_device_task.delay(str(device.pk), otp)
+        return Response({"detail": "queued"}, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=True, methods=["post"])
+    def activate(self, request, pk=None):
+        """Trade the compliance CSID for the production CSID. Admin+."""
+        device = self.get_object()
+        require_org_role(request.user, device.organization_id, UserRole.Role.ADMIN)
+        if device.status != ZatcaDevice.Status.ONBOARDED:
+            raise ValidationError("The device must hold a compliance CSID first.")
+        activate_zatca_device_task.delay(str(device.pk))
+        return Response({"detail": "queued"}, status=status.HTTP_202_ACCEPTED)
 
 
 class ZatcaCounterViewSet(TenantScopedReadOnlyViewSet):
@@ -172,4 +304,3 @@ class DunningAttemptViewSet(TenantScopedReadOnlyViewSet):
     queryset = DunningAttempt.objects.select_related("subscription")
     serializer_class = serializers.DunningAttemptSerializer
     org_field = "subscription__organization"
->>>>>>> a3235b4 (feat(db): initialize core relational schema)

@@ -8,3 +8,13 @@ wheels/
 
 # Virtual environments
 .venv
+.namaa
+
+# Secrets — env files are never committed (use backend/.env.example)
+.env
+*.env
+!.env.example
+!*/.env.example
+
+# Local databases
+*.sqlite3
