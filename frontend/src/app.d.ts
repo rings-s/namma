@@ -10,7 +10,10 @@ declare global {
 		}
 
 		// interface Error {}
-		// interface Locals {}
+		interface Locals {
+			user: Record<string, unknown> | null;
+			accessToken: string | null;
+		}
 		// interface PageData {}
 		// interface PageState {}
 	}
