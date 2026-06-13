@@ -18,3 +18,4 @@ wheels/
 
 # Local databases
 *.sqlite3
+.claude/worktrees/
