@@ -1,3 +1,29 @@
 @import 'tailwindcss';
 @plugin '@tailwindcss/forms';
 @plugin '@tailwindcss/typography';
+
+@theme {
+	--color-brand-50: #eef6f1;
+	--color-brand-100: #d4eadd;
+	--color-brand-200: #a9d5bb;
+	--color-brand-300: #74ba93;
+	--color-brand-400: #459a6e;
+	--color-brand-500: #2f7d55;
+	--color-brand-600: #226342;
+	--color-brand-700: #1c4f36;
+	--color-brand-800: #173f2c;
+	--color-brand-900: #123124;
+	--font-sans: 'Inter', 'IBM Plex Sans Arabic', system-ui, sans-serif;
+}
+
+html,
+body {
+	height: 100%;
+}
+
+body {
+	background-color: var(--color-slate-50);
+	color: var(--color-slate-900);
+	font-family: var(--font-sans);
+	-webkit-font-smoothing: antialiased;
+}

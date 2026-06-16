@@ -15,6 +15,17 @@ export default defineConfig({
 			adapter: adapter()
 		})
 	],
+	server: {
+		// The Django backend ships no CORS config, so in dev we proxy the API
+		// through Vite to keep every request same-origin. Override the target
+		// with VITE_API_PROXY_TARGET if the backend runs elsewhere.
+		proxy: {
+			'/api': {
+				target: process.env.VITE_API_PROXY_TARGET || 'http://127.0.0.1:8000',
+				changeOrigin: true
+			}
+		}
+	},
 	test: {
 		expect: { requireAssertions: true },
 		projects: [
