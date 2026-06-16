@@ -77,7 +77,9 @@ class MessageDispatch(BaseModel):
     status = models.CharField(
         max_length=20, choices=Status.choices, default=Status.QUEUED
     )
-    external_message_id = models.CharField(max_length=255, blank=True)
+    # Webhook receivers look dispatches up by this on every delivery receipt
+    # (3-5x per message); the index keeps that hot path off a full table scan.
+    external_message_id = models.CharField(max_length=255, blank=True, db_index=True)
     cost = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     sent_at = models.DateTimeField(null=True, blank=True)
     delivered_at = models.DateTimeField(null=True, blank=True)
@@ -144,6 +146,40 @@ class EmailEvent(BaseModel):
 
     def __str__(self):
         return f"{self.event_type}:{self.sns_message_id}"
+
+
+class WhatsAppWebhookEvent(BaseModel):
+    """One inbound WhatsApp Cloud API webhook delivery, stored before it is
+    applied — mirroring the SES/Moyasar pattern.
+
+    Persisting the raw payload (instead of shipping it through the broker as a
+    task argument) keeps the queue small, gives an audit/replay trail, and
+    dedupes Meta's at-least-once retries via ``body_signature`` (a hash of the
+    exact request body). A worker applies the delivery statuses; application is
+    idempotent (timestamps set once, status only moves forward).
+    """
+
+    class ProcessingStatus(models.TextChoices):
+        PENDING = "pending", "Pending"
+        PROCESSED = "processed", "Processed"
+        IGNORED = "ignored", "Ignored"
+        FAILED = "failed", "Failed"
+
+    body_signature = models.CharField(max_length=64, unique=True)
+    payload = models.JSONField(default=dict, blank=True)
+    processing_status = models.CharField(
+        max_length=20,
+        choices=ProcessingStatus.choices,
+        default=ProcessingStatus.PENDING,
+    )
+    statuses_applied = models.PositiveIntegerField(default=0)
+    processed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"WhatsApp webhook {self.body_signature[:12]} ({self.processing_status})"
 
 
 class ConsentRecord(BaseModel):

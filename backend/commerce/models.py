@@ -81,6 +81,14 @@ class Product(SoftDeleteModel, BaseModel):
             models.Index(fields=["organization", "sku"]),
             models.Index(fields=["organization", "is_active"]),
         ]
+        constraints = [
+            # Stock can never go negative: sales are blocked at the service
+            # layer, but the database is the final backstop against overselling.
+            models.CheckConstraint(
+                condition=models.Q(stock_quantity__gte=0),
+                name="product_stock_quantity_gte_0",
+            ),
+        ]
 
     def __str__(self):
         return self.name

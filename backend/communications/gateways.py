@@ -14,6 +14,9 @@ account configuration set so bounces/complaints/deliveries flow back through
 SNS to our webhook, plus per-message tags for reconciliation.
 """
 
+import hashlib
+import hmac
+
 import boto3
 import httpx
 from botocore.exceptions import BotoCoreError, ClientError
@@ -172,3 +175,131 @@ class SESEmailClient:
             # Connection/endpoint problems: nothing was rejected, retry.
             raise SESError(f"SES request failed: {exc}", retryable=True) from exc
         return str(response.get("MessageId", ""))
+
+
+class WhatsAppError(Exception):
+    """A failed WhatsApp Cloud API call. ``retryable`` separates transient
+    failures (network, HTTP 429/5xx) worth retrying from definitive rejections
+    (invalid number, expired token, template not approved) that are final."""
+
+    def __init__(self, message, status_code=None, payload=None, retryable=False):
+        super().__init__(message)
+        self.status_code = status_code
+        self.payload = payload or {}
+        self.retryable = retryable
+
+
+class WhatsAppCloudClient:
+    """Thin wrapper over the Meta WhatsApp Cloud API (Graph API).
+
+    Sends go to ``POST /{version}/{phone_number_id}/messages`` with a Bearer
+    access token. ``transport`` is injectable so tests run against
+    ``httpx.MockTransport`` without network, mirroring the Taqnyat client.
+    """
+
+    def __init__(
+        self,
+        access_token=None,
+        phone_number_id=None,
+        base_url=None,
+        api_version=None,
+        transport=None,
+        timeout=10.0,
+    ):
+        self.phone_number_id = phone_number_id or settings.WHATSAPP_PHONE_NUMBER_ID
+        token = (
+            access_token if access_token is not None else settings.WHATSAPP_ACCESS_TOKEN
+        )
+        version = api_version or settings.WHATSAPP_API_VERSION
+        base = (base_url or settings.WHATSAPP_API_BASE_URL).rstrip("/")
+        self._client = httpx.Client(
+            base_url=f"{base}/{version}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            timeout=timeout,
+            transport=transport,
+        )
+
+    def _post_message(self, payload):
+        path = f"/{self.phone_number_id}/messages"
+        try:
+            response = self._client.post(path, json=payload)
+        except httpx.HTTPError as exc:
+            raise WhatsAppError(
+                f"WhatsApp request failed: {exc}", retryable=True
+            ) from exc
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+        if response.is_success:
+            return data
+        error = data.get("error") if isinstance(data.get("error"), dict) else {}
+        raise WhatsAppError(
+            error.get("message") or f"WhatsApp returned HTTP {response.status_code}",
+            status_code=response.status_code,
+            payload=data,
+            # 429 + 5xx are transient; 4xx (bad number/token/template) are final.
+            retryable=response.status_code == 429 or response.status_code >= 500,
+        )
+
+    def send_text(self, to, body, preview_url=False):
+        """Free-form text — only deliverable inside the 24h customer service
+        window. Use ``send_template`` to (re)open a conversation."""
+        return self._post_message(
+            {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": normalize_msisdn(to),
+                "type": "text",
+                "text": {"preview_url": preview_url, "body": body},
+            }
+        )
+
+    def send_template(self, to, template_name, language_code, components=None):
+        """Pre-approved template message — the only kind that can initiate a
+        conversation (reminders, marketing, OTP). ``components`` carries the
+        body/header/button variables per the Cloud API schema."""
+        template = {"name": template_name, "language": {"code": language_code}}
+        if components:
+            template["components"] = components
+        return self._post_message(
+            {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": normalize_msisdn(to),
+                "type": "template",
+                "template": template,
+            }
+        )
+
+    @staticmethod
+    def first_message_id(response):
+        """The ``wamid.*`` id of the first message in a send response."""
+        messages = response.get("messages") or []
+        return str(messages[0].get("id", "")) if messages else ""
+
+    def close(self):
+        self._client.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+
+
+def verify_whatsapp_signature(payload_body, signature_header, app_secret=None):
+    """True iff ``payload_body`` (raw request bytes) carries a valid Meta
+    ``X-Hub-Signature-256`` HMAC. Fails closed when the app secret is unset, so
+    a misconfigured deployment rejects webhooks rather than trusting them."""
+    secret = app_secret if app_secret is not None else settings.WHATSAPP_APP_SECRET
+    if not secret or not signature_header or not signature_header.startswith("sha256="):
+        return False
+    expected = hmac.new(
+        secret.encode("utf-8"), payload_body, hashlib.sha256
+    ).hexdigest()
+    provided = signature_header.split("=", 1)[1]
+    return hmac.compare_digest(expected, provided)

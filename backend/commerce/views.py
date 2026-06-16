@@ -72,6 +72,45 @@ class SaleViewSet(TenantScopedViewSet):
     search_fields = ["sale_number"]
     ordering_fields = ["created_at", "total_amount"]
 
+    def perform_create(self, serializer):
+        from django.db import transaction
+
+        from commerce.services import commit_sale_stock
+        from financials.models import DocumentSequence
+        from financials.services import next_document_number
+
+        self._check_tenant_ownership(serializer)
+        data = serializer.validated_data
+        try:
+            with transaction.atomic():
+                sale = serializer.save(
+                    sale_number=next_document_number(
+                        organization=data["organization"],
+                        document_type=DocumentSequence.DocumentType.SALE,
+                        branch=data.get("branch"),
+                    )
+                )
+                # A sale created already-completed commits its stock now (any
+                # lines added later complete via the update path).
+                commit_sale_stock(sale, created_by=self.request.user)
+        except DjangoValidationError as exc:
+            raise ValidationError(exc.messages)
+
+    def perform_update(self, serializer):
+        """Commit stock when a sale transitions into COMPLETED. Idempotent, so
+        edits to an already-completed sale never double-deduct."""
+        from django.db import transaction
+
+        from commerce.services import commit_sale_stock
+
+        self._check_tenant_ownership(serializer)
+        try:
+            with transaction.atomic():
+                sale = serializer.save()
+                commit_sale_stock(sale, created_by=self.request.user)
+        except DjangoValidationError as exc:
+            raise ValidationError(exc.messages)
+
     @action(detail=True, methods=["post"])
     def commissions(self, request, pk=None):
         """Queue commission calculation for a completed sale. Manager+.

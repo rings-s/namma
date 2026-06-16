@@ -104,3 +104,65 @@ class IdempotencyKeyTests(TestCase):
                 format="json",
             )
         self.assertEqual(Customer.objects.count(), 2)
+
+
+class DomainEventSeamTests(TestCase):
+    """The explicit in-process event bus: commit-safe, non-blocking dispatch."""
+
+    def setUp(self):
+        # Snapshot and restore the registry so these tests don't wipe the
+        # real AppConfig.ready() subscriptions for the rest of the suite.
+        import copy
+
+        from core import events
+
+        original = copy.deepcopy(events._subscribers)
+        events.clear_subscribers()
+        self.addCleanup(events._subscribers.update, original)
+        self.addCleanup(events.clear_subscribers)
+
+    def _recording_task(self):
+        calls = []
+
+        class _Task:
+            def delay(self_inner, **kwargs):
+                calls.append(kwargs)
+
+        return _Task(), calls
+
+    def test_publish_enqueues_subscribers_after_commit(self):
+        from core.events import publish, subscribe
+
+        task, calls = self._recording_task()
+        subscribe("ai.recommendations_generated", task)
+
+        # Inside an atomic block the dispatch must wait for commit.
+        with self.captureOnCommitCallbacks(execute=True):
+            publish("ai.recommendations_generated", {"organization_id": "abc"})
+            self.assertEqual(calls, [])  # not yet — transaction still open
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "event_type": "ai.recommendations_generated",
+                    "payload": {"organization_id": "abc"},
+                }
+            ],
+        )
+
+    def test_publish_without_subscribers_is_noop(self):
+        from core.events import publish
+
+        with self.captureOnCommitCallbacks(execute=True):
+            publish("ai.recommendations_generated", {"x": 1})  # must not raise
+
+    def test_enqueue_failure_does_not_propagate(self):
+        from core.events import publish, subscribe
+
+        class _Boom:
+            def delay(self, **kwargs):
+                raise RuntimeError("broker down")
+
+        subscribe("ai.recommendations_generated", _Boom())
+        with self.captureOnCommitCallbacks(execute=True):
+            publish("ai.recommendations_generated", {})  # swallowed, logged

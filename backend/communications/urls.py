@@ -9,6 +9,11 @@ urlpatterns = [
         views.SESWebhookView.as_view(),
         name="ses_webhook",
     ),
+    path(
+        "webhooks/whatsapp/",
+        views.WhatsAppWebhookView.as_view(),
+        name="whatsapp_webhook",
+    ),
 ]
 
 router = DefaultRouter()

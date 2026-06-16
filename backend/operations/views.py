@@ -1,4 +1,6 @@
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 
 from accounts.models import UserRole
@@ -7,6 +9,7 @@ from core.api import (
     TenantScopedViewSet,
     require_org_role,
 )
+from core.audit import record_audit
 from operations import serializers
 from operations.models import (
     Appointment,
@@ -34,7 +37,14 @@ from operations.models import (
     TicketVerification,
     WaitlistEntry,
 )
-from operations.services import employee_loaded_cost, organization_labor_summary
+from operations.services import (
+    book_appointment,
+    employee_loaded_cost,
+    organization_labor_summary,
+    release_event_capacity,
+    reschedule_appointment,
+    reserve_event_capacity,
+)
 
 
 class EmployeeViewSet(TenantScopedViewSet):
@@ -113,6 +123,36 @@ class AppointmentViewSet(TenantScopedViewSet):
     search_fields = ["customer__first_name", "customer__last_name", "customer__phone"]
     ordering_fields = ["scheduled_at", "created_at"]
 
+    def perform_create(self, serializer):
+        """Create the appointment, rejecting a double-booking of the assigned
+        employee under concurrency (the slot check holds a row lock)."""
+        self._check_tenant_ownership(serializer)
+        try:
+            appointment = book_appointment(serializer)
+        except DjangoValidationError as exc:
+            raise ValidationError(exc.messages)
+        record_audit(
+            action="booking.appointment_created",
+            entity_type="Appointment",
+            entity_id=appointment.id,
+            organization=appointment.organization,
+            user=self.request.user,
+            new_values={
+                "scheduled_at": appointment.scheduled_at.isoformat(),
+                "employee": str(appointment.employee_id),
+            },
+            request=self.request,
+        )
+
+    def perform_update(self, serializer):
+        """Reschedule, re-validating the employee calendar when the slot or
+        assignee changed."""
+        self._check_tenant_ownership(serializer)
+        try:
+            reschedule_appointment(serializer)
+        except DjangoValidationError as exc:
+            raise ValidationError(exc.messages)
+
 
 class AppointmentReminderViewSet(TenantScopedViewSet):
     queryset = AppointmentReminder.objects.select_related("appointment")
@@ -125,6 +165,67 @@ class BookingViewSet(TenantScopedViewSet):
     serializer_class = serializers.BookingSerializer
     search_fields = ["booking_number"]
     ordering_fields = ["booked_at", "created_at"]
+
+    #: Booking statuses that no longer hold a reserved seat.
+    _RELEASED_STATUSES = (Booking.Status.CANCELLED, Booking.Status.NO_SHOW)
+
+    def perform_create(self, serializer):
+        """Create the booking; for event bookings reserve capacity atomically
+        so concurrent requests cannot oversell the event. The booking number is
+        allocated server-side from DocumentSequence."""
+        self._check_tenant_ownership(serializer)
+        from django.db import transaction
+
+        from financials.models import DocumentSequence
+        from financials.services import next_document_number
+
+        data = serializer.validated_data
+        event = data.get("event")
+        quantity = data.get("quantity", 1)
+        try:
+            with transaction.atomic():
+                if event is not None:
+                    reserve_event_capacity(event.id, quantity)
+                booking = serializer.save(
+                    booking_number=next_document_number(
+                        organization=data["organization"],
+                        document_type=DocumentSequence.DocumentType.BOOKING,
+                        branch=data.get("branch"),
+                    )
+                )
+        except DjangoValidationError as exc:
+            raise ValidationError(exc.messages)
+        record_audit(
+            action="booking.booking_created",
+            entity_type="Booking",
+            entity_id=booking.id,
+            organization=booking.organization,
+            user=self.request.user,
+            new_values={
+                "booking_number": booking.booking_number,
+                "event": str(booking.event_id),
+                "quantity": booking.quantity,
+            },
+            request=self.request,
+        )
+
+    def perform_update(self, serializer):
+        """On a transition into a cancelled/no-show state, return the reserved
+        seats to the event."""
+        self._check_tenant_ownership(serializer)
+        from django.db import transaction
+
+        instance = serializer.instance
+        was_active = instance.status not in self._RELEASED_STATUSES
+        new_status = serializer.validated_data.get("status", instance.status)
+        with transaction.atomic():
+            booking = serializer.save()
+            if (
+                was_active
+                and new_status in self._RELEASED_STATUSES
+                and booking.event_id is not None
+            ):
+                release_event_capacity(booking.event_id, booking.quantity)
 
 
 class BookingAttendeeViewSet(TenantScopedViewSet):

@@ -39,6 +39,7 @@ class DocumentSequence(BaseModel):
         SALE = "sale", "Sale"
         BOOKING = "booking", "Booking"
         TICKET = "ticket", "Ticket"
+        PURCHASE_ORDER = "purchase_order", "Purchase Order"
 
     organization = models.ForeignKey(
         "organizations.Organization",
@@ -62,7 +63,16 @@ class DocumentSequence(BaseModel):
             models.UniqueConstraint(
                 fields=["organization", "branch", "document_type", "year"],
                 name="uniq_document_sequence",
-            )
+            ),
+            # NULLs compare distinct under a plain unique constraint, so the
+            # one above does NOT dedupe organization-wide (branch-less)
+            # sequences. This partial constraint closes that gap, guaranteeing
+            # a single counter row per scope so numbering can't fork.
+            models.UniqueConstraint(
+                fields=["organization", "document_type", "year"],
+                condition=models.Q(branch__isnull=True),
+                name="uniq_document_sequence_no_branch",
+            ),
         ]
 
     def __str__(self):

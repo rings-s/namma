@@ -47,6 +47,7 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
         fields = "__all__"
         read_only_fields = (
             *AUDIT_FIELDS,
+            "po_number",  # server-assigned via the document-number sequence
             "status",
             "submitted_at",
             "received_at",

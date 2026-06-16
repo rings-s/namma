@@ -382,7 +382,8 @@ class EmailDispatchTests(APITestCase):
         self.assertEqual(dispatch.external_message_id, "ses-msg-77")
 
     def test_api_send_action_rejects_channels_without_gateway(self):
-        dispatch = self._dispatch(channel=Channel.WHATSAPP)
+        # Push has no outbound gateway (SMS/email/WhatsApp all do).
+        dispatch = self._dispatch(channel=Channel.PUSH)
         self.client.force_authenticate(self.owner)
         response = self.client.post(f"/api/v1/message-dispatches/{dispatch.id}/send/")
         self.assertEqual(response.status_code, 400)

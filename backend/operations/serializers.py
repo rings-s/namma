@@ -89,7 +89,8 @@ class BookingSerializer(serializers.ModelSerializer):
     class Meta:
         model = Booking
         fields = "__all__"
-        read_only_fields = (*AUDIT_FIELDS, "version")
+        # booking_number is allocated server-side from DocumentSequence.
+        read_only_fields = (*AUDIT_FIELDS, "version", "booking_number")
 
 
 class BookingAttendeeSerializer(serializers.ModelSerializer):

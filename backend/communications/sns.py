@@ -77,6 +77,13 @@ def _signing_certificate(cert_url):
     cache_key = f"{_CERT_CACHE_PREFIX}{cert_url}"
     pem = cache.get(cache_key)
     if pem is None:
+        # This synchronous fetch runs inside the SES webhook request, which our
+        # rules normally forbid. It is a deliberate, bounded exception: the cert
+        # cannot be pre-warmed (AWS embeds a rotating filename in SigningCertURL,
+        # unknown until a message arrives), verification must precede trust, the
+        # result is shared-cached for 24h across the whole fleet, and SNS retries
+        # are deduped idempotently — so the cold-cache cost is paid at most once
+        # per cert rotation, fleet-wide. The 10s timeout caps the worst case.
         try:
             response = httpx.get(cert_url, timeout=10.0)
             response.raise_for_status()

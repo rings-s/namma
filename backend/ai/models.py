@@ -6,6 +6,39 @@ from django.db import models
 from core.models import BaseModel
 
 
+class AIProvenanceMixin(models.Model):
+    """Provenance for any row produced by an LLM call.
+
+    Captured at write time from the gateway's ``ChatResult`` so AI output stays
+    auditable as providers and models change underneath us: incident review can
+    tell which model/prompt produced a row, and cost/latency can be reported per
+    tenant. Typed columns (not a JSON blob) so they stay queryable and indexable.
+    Non-AI rows (e.g. a user's own chat turn) simply leave these at their
+    defaults.
+    """
+
+    ai_provider = models.CharField(max_length=50, blank=True)
+    ai_model = models.CharField(max_length=120, blank=True)
+    #: Bumped in code whenever a system prompt changes materially, so a regression
+    #: in output quality can be traced to the prompt revision that caused it.
+    prompt_version = models.CharField(max_length=50, blank=True)
+    prompt_tokens = models.PositiveIntegerField(default=0)
+    completion_tokens = models.PositiveIntegerField(default=0)
+    latency_ms = models.PositiveIntegerField(default=0)
+    temperature = models.DecimalField(
+        max_digits=3, decimal_places=2, null=True, blank=True
+    )
+    #: Provider-billed cost in SAR-equivalent; 0 for free/local runtimes.
+    cost = models.DecimalField(max_digits=12, decimal_places=6, default=0)
+    #: Optional model- or heuristic-reported confidence (0.000–1.000).
+    confidence = models.DecimalField(
+        max_digits=4, decimal_places=3, null=True, blank=True
+    )
+
+    class Meta:
+        abstract = True
+
+
 class AIConversation(BaseModel):
     organization = models.ForeignKey(
         "organizations.Organization",
@@ -27,7 +60,7 @@ class AIConversation(BaseModel):
         return self.title or f"Conversation {self.id}"
 
 
-class AIMessage(BaseModel):
+class AIMessage(AIProvenanceMixin, BaseModel):
     class Role(models.TextChoices):
         SYSTEM = "system", "System"
         USER = "user", "User"
@@ -48,7 +81,7 @@ class AIMessage(BaseModel):
         return f"{self.get_role_display()} message in {self.conversation_id}"
 
 
-class AIRecommendation(BaseModel):
+class AIRecommendation(AIProvenanceMixin, BaseModel):
     class Priority(models.TextChoices):
         LOW = "low", "Low"
         MEDIUM = "medium", "Medium"
@@ -81,6 +114,15 @@ class AIRecommendation(BaseModel):
         ordering = ["-created_at"]
         indexes = [
             models.Index(fields=["organization", "status"]),
+        ]
+        constraints = [
+            # Makes generate_recommendations' get_or_create genuinely
+            # idempotent: a concurrent manual + scheduled refresh can't insert
+            # the same active recommendation twice.
+            models.UniqueConstraint(
+                fields=["organization", "title", "status"],
+                name="uniq_active_recommendation_per_title",
+            ),
         ]
 
     def __str__(self):

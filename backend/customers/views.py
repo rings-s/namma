@@ -5,6 +5,7 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 
 from accounts.models import UserRole
+from ai.tasks import generate_ai_segment_task
 from core.api import TenantScopedViewSet, require_org_role
 from customers.models import (
     ClinicalNote,
@@ -84,6 +85,21 @@ class CustomerSegmentViewSet(TenantScopedViewSet):
         refresh_segment(segment)
         segment = self.get_queryset().get(pk=segment.pk)
         return Response(self.get_serializer(segment).data)
+
+    @action(detail=True, methods=["post"])
+    def generate(self, request, pk=None):
+        """Build an AI segment's criteria from its description and materialize
+        its membership on a worker (marketer+). The LLM call never blocks the
+        request — poll the segment for ``last_refreshed_at``/``member_count``."""
+        segment = self.get_object()
+        if segment.segment_type != CustomerSegment.SegmentType.AI:
+            raise ValidationError("Only AI segments can be generated.")
+        require_org_role(request.user, segment.organization_id, "marketer")
+        generate_ai_segment_task.delay(str(segment.pk))
+        return Response(
+            {"detail": "AI segment generation queued."},
+            status=status.HTTP_202_ACCEPTED,
+        )
 
 
 class CustomerSegmentMembershipViewSet(TenantScopedViewSet):

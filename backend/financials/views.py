@@ -4,7 +4,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import generics, mixins, permissions, status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 
 from accounts.models import UserRole
@@ -17,9 +17,12 @@ from core.api import (
 from financials import serializers
 from financials.models import Gateway
 from financials.services import (
+    next_document_number,
+    post_journal_entry,
     validate_e_invoice_generable,
     validate_refund_executable,
 )
+from financials.models import DocumentSequence as _DocumentSequence
 from financials.tasks import (
     activate_zatca_device_task,
     execute_moyasar_refund_task,
@@ -64,6 +67,16 @@ class InvoiceViewSet(TenantScopedViewSet):
     search_fields = ["invoice_number"]
     ordering_fields = ["issued_at", "due_date", "total_amount", "created_at"]
 
+    def perform_create(self, serializer):
+        self._check_tenant_ownership(serializer)
+        organization = serializer.validated_data["organization"]
+        serializer.save(
+            invoice_number=next_document_number(
+                organization=organization,
+                document_type=_DocumentSequence.DocumentType.INVOICE,
+            )
+        )
+
     @action(detail=True, methods=["post"], url_path="einvoice")
     def einvoice(self, request, pk=None):
         """Queue ZATCA e-invoice generation + submission. Accountant+ only.
@@ -98,11 +111,29 @@ class CreditNoteViewSet(TenantScopedViewSet):
     serializer_class = serializers.CreditNoteSerializer
     search_fields = ["credit_note_number"]
 
+    def perform_create(self, serializer):
+        self._check_tenant_ownership(serializer)
+        serializer.save(
+            credit_note_number=next_document_number(
+                organization=serializer.validated_data["organization"],
+                document_type=_DocumentSequence.DocumentType.CREDIT_NOTE,
+            )
+        )
+
 
 class DebitNoteViewSet(TenantScopedViewSet):
     queryset = DebitNote.objects.select_related("original_invoice")
     serializer_class = serializers.DebitNoteSerializer
     search_fields = ["debit_note_number"]
+
+    def perform_create(self, serializer):
+        self._check_tenant_ownership(serializer)
+        serializer.save(
+            debit_note_number=next_document_number(
+                organization=serializer.validated_data["organization"],
+                document_type=_DocumentSequence.DocumentType.DEBIT_NOTE,
+            )
+        )
 
 
 class PaymentIntentViewSet(TenantScopedViewSet):
@@ -131,7 +162,8 @@ class RefundViewSet(TenantScopedViewSet):
         except DjangoValidationError as exc:
             raise ValidationError(exc.messages)
         execute_moyasar_refund_task.delay(str(refund.pk), str(request.user.pk))
-        refund.refresh_from_db()
+        # 202 + the pending state is the contract: the worker hasn't run yet,
+        # so re-reading the row here would only echo back the same pre-task state.
         return Response(
             serializers.RefundSerializer(refund).data, status=status.HTTP_202_ACCEPTED
         )
@@ -213,6 +245,39 @@ class LedgerEntryViewSet(
     queryset = LedgerEntry.objects.select_related("account")
     serializer_class = serializers.LedgerEntrySerializer
     ordering_fields = ["posted_at", "created_at"]
+
+    def create(self, request, *args, **kwargs):
+        """Post a *balanced* journal transaction.
+
+        Accepts a list of ledger lines (or a single line, which is rejected as
+        unbalanced). All lines must target one organization the caller controls
+        and total debits must equal total credits; the lines are written under
+        one server-assigned transaction id. This replaces the old single-line
+        create that could record half a transaction.
+        """
+        payload = request.data if isinstance(request.data, list) else [request.data]
+        serializer = self.get_serializer(data=payload, many=True)
+        serializer.is_valid(raise_exception=True)
+        lines = serializer.validated_data
+        if not lines:
+            raise ValidationError("Provide the journal lines to post.")
+
+        organizations = {line["organization"] for line in lines}
+        if len(organizations) > 1:
+            raise ValidationError(
+                "All lines of a journal transaction share one organization."
+            )
+        organization = organizations.pop()
+        org_ids = self.allowed_organization_ids()
+        if org_ids is not None and organization.id not in org_ids:
+            raise PermissionDenied("You do not have access to this organization.")
+
+        try:
+            entries = post_journal_entry(organization=organization, lines=lines)
+        except DjangoValidationError as exc:
+            raise ValidationError(exc.messages)
+        output = self.get_serializer(entries, many=True)
+        return Response(output.data, status=status.HTTP_201_CREATED)
 
 
 class ZatcaDeviceViewSet(TenantScopedViewSet):

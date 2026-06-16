@@ -100,6 +100,9 @@ REST_FRAMEWORK = {
         # set DJANGO_DEBUG=false and get the real limits.
         "anon": os.environ.get("API_THROTTLE_ANON", "60/min"),
         "user": os.environ.get("API_THROTTLE_USER", "600/min"),
+        # Dedicated tight limit for login (keyed on IP + email) to blunt
+        # brute-force attacks without touching the shared anon bucket.
+        "login": os.environ.get("API_THROTTLE_LOGIN", "5/min"),
     },
 }
 
@@ -107,6 +110,8 @@ if DEBUG:  # local runs and the test suite share one client IP
     REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"] = {
         "anon": "10000/min",
         "user": "10000/min",
+        # Kept tight even in DEBUG so the brute-force guard stays testable.
+        "login": os.environ.get("API_THROTTLE_LOGIN", "5/min"),
     }
 
 # JWT auth (djangorestframework-simplejwt). Lifetimes/keys come from env in
@@ -141,6 +146,24 @@ MOYASAR_WEBHOOK_SECRET = os.environ.get("MOYASAR_WEBHOOK_SECRET", "")
 TAQNYAT_API_BASE_URL = os.environ.get("TAQNYAT_API_BASE_URL", "https://api.taqnyat.sa")
 TAQNYAT_BEARER_TOKEN = os.environ.get("TAQNYAT_BEARER_TOKEN", "")
 TAQNYAT_SMS_SENDER = os.environ.get("TAQNYAT_SMS_SENDER", "")
+
+# WhatsApp via the Meta WhatsApp Cloud API (graph.facebook.com). The Cloud API
+# is Meta-hosted (no on-prem servers), the standard direct integration with
+# per-message pricing and no BSP markup — the primary channel for the GCC market.
+# Values come from Meta App Dashboard > WhatsApp:
+# - WHATSAPP_PHONE_NUMBER_ID: the sender number's id (NOT the display number)
+# - WHATSAPP_ACCESS_TOKEN: a permanent System User token (not the 24h test token)
+# - WHATSAPP_APP_SECRET: signs inbound webhooks (X-Hub-Signature-256)
+# - WHATSAPP_WEBHOOK_VERIFY_TOKEN: the string echoed during webhook subscription
+# API version is pinned and overridable so upgrades are a config change.
+WHATSAPP_API_BASE_URL = os.environ.get(
+    "WHATSAPP_API_BASE_URL", "https://graph.facebook.com"
+)
+WHATSAPP_API_VERSION = os.environ.get("WHATSAPP_API_VERSION", "v21.0")
+WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "")
+WHATSAPP_ACCESS_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN", "")
+WHATSAPP_APP_SECRET = os.environ.get("WHATSAPP_APP_SECRET", "")
+WHATSAPP_WEBHOOK_VERIFY_TOKEN = os.environ.get("WHATSAPP_WEBHOOK_VERIFY_TOKEN", "")
 
 # Email via Amazon SES. Two paths share the same verified identity:
 # - Django framework mail (password resets, admin error reports) goes over
@@ -195,6 +218,16 @@ ZATCA_API_BASE_URL = os.environ.get(
 )
 ZATCA_KEY_ENCRYPTION_KEY = os.environ.get("ZATCA_KEY_ENCRYPTION_KEY", "")
 
+# Provider-agnostic LLM gateway (ai.gateways.AIClient) over the OpenAI-compatible
+# Chat Completions API. Defaults target Groq's free hosted endpoint for testing;
+# switch to a local private model by changing ONLY these values — e.g. Ollama:
+#   AI_BASE_URL=http://localhost:11434/v1  AI_API_KEY=ollama  AI_MODEL=llama3.1
+# Get a free Groq key at https://console.groq.com/keys.
+AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://api.groq.com/openai/v1")
+AI_API_KEY = os.environ.get("AI_API_KEY", "")
+AI_MODEL = os.environ.get("AI_MODEL", "llama-3.3-70b-versatile")
+AI_REQUEST_TIMEOUT = float(os.environ.get("AI_REQUEST_TIMEOUT", "60"))
+
 # Celery (settings consumed via config_from_object namespace="CELERY").
 # Redis is both broker and result backend; gateway calls and webhook
 # processing run on workers so requests never block on third parties.
@@ -208,6 +241,21 @@ CELERY_TASK_ALWAYS_EAGER = os.environ.get(
     "CELERY_TASK_ALWAYS_EAGER", "false"
 ).lower() in ("1", "true", "yes")
 CELERY_TASK_EAGER_PROPAGATES = True
+
+# Periodic recovery sweeps (run a `celery beat` process to activate). These
+# re-enqueue webhook events that are still pending or were dead-lettered after
+# retries, so a transient outage never permanently strands a paid payment or a
+# delivery/bounce receipt. Processing is idempotent, so replay is safe.
+CELERY_BEAT_SCHEDULE = {
+    "reprocess-stuck-payment-webhooks": {
+        "task": "financials.tasks.reprocess_stuck_payment_webhook_events",
+        "schedule": 300.0,  # every 5 minutes
+    },
+    "reprocess-stuck-ses-events": {
+        "task": "communications.tasks.reprocess_stuck_ses_events",
+        "schedule": 300.0,
+    },
+}
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",

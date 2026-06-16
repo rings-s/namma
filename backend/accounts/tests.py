@@ -2,6 +2,8 @@
 
 import pyotp
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
+from django.test import override_settings
 from rest_framework.test import APITestCase
 
 from accounts.models import TwoFactorDevice, UserRole
@@ -16,6 +18,11 @@ class JwtAuthenticationTests(APITestCase):
         cls.user = User.objects.create_user(
             email="jwt@namaa.sa", password="Str0ng!pass"
         )
+
+    def setUp(self):
+        # The login throttle is cache-backed and LocMemCache persists across
+        # test methods in a process; clear it so per-test login counts isolate.
+        cache.clear()
 
     def test_register_creates_user_with_hashed_password(self):
         response = self.client.post(
@@ -65,6 +72,57 @@ class JwtAuthenticationTests(APITestCase):
             "/api/v1/auth/token/refresh/", {"refresh": pair["refresh"]}
         )
         self.assertEqual(refresh.status_code, 401)
+
+
+@override_settings(
+    REST_FRAMEWORK={
+        "DEFAULT_AUTHENTICATION_CLASSES": [
+            "rest_framework_simplejwt.authentication.JWTAuthentication",
+        ],
+        "DEFAULT_THROTTLE_RATES": {
+            "anon": "10000/min",
+            "user": "10000/min",
+            "login": "5/min",
+        },
+    }
+)
+class LoginBruteForceThrottleTests(APITestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user(
+            email="target@namaa.sa", password="Str0ng!pass"
+        )
+
+    def setUp(self):
+        cache.clear()
+
+    def test_repeated_wrong_password_attempts_are_throttled(self):
+        # Five tries are allowed; the sixth for the same IP+email is blocked.
+        for _ in range(5):
+            response = self.client.post(
+                "/api/v1/auth/token/",
+                {"email": "target@namaa.sa", "password": "wrong"},
+            )
+            self.assertEqual(response.status_code, 401)
+        blocked = self.client.post(
+            "/api/v1/auth/token/",
+            {"email": "target@namaa.sa", "password": "wrong"},
+        )
+        self.assertEqual(blocked.status_code, 429)
+
+    def test_other_account_is_not_collateral_throttled(self):
+        # Exhaust the limit for one email...
+        for _ in range(6):
+            self.client.post(
+                "/api/v1/auth/token/",
+                {"email": "target@namaa.sa", "password": "wrong"},
+            )
+        # ...a different email from the same IP is still served.
+        other = self.client.post(
+            "/api/v1/auth/token/",
+            {"email": "bystander@namaa.sa", "password": "wrong"},
+        )
+        self.assertEqual(other.status_code, 401)
 
 
 class TwoFactorAuthenticationTests(APITestCase):

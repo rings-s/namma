@@ -38,21 +38,27 @@ class InvoiceSerializer(serializers.ModelSerializer):
     class Meta:
         model = Invoice
         fields = "__all__"
-        read_only_fields = (*AUDIT_FIELDS, "amount_paid", "amount_due")
+        # invoice_number is allocated server-side from DocumentSequence.
+        read_only_fields = (
+            *AUDIT_FIELDS,
+            "invoice_number",
+            "amount_paid",
+            "amount_due",
+        )
 
 
 class CreditNoteSerializer(serializers.ModelSerializer):
     class Meta:
         model = CreditNote
         fields = "__all__"
-        read_only_fields = AUDIT_FIELDS
+        read_only_fields = (*AUDIT_FIELDS, "credit_note_number")
 
 
 class DebitNoteSerializer(serializers.ModelSerializer):
     class Meta:
         model = DebitNote
         fields = "__all__"
-        read_only_fields = AUDIT_FIELDS
+        read_only_fields = (*AUDIT_FIELDS, "debit_note_number")
 
 
 class PaymentIntentSerializer(serializers.ModelSerializer):
@@ -105,7 +111,9 @@ class LedgerEntrySerializer(serializers.ModelSerializer):
     class Meta:
         model = LedgerEntry
         fields = "__all__"
-        read_only_fields = AUDIT_FIELDS
+        # transaction_id groups a balanced set of lines and is assigned by the
+        # posting service, never by the client.
+        read_only_fields = (*AUDIT_FIELDS, "transaction_id")
 
 
 class ZatcaDeviceSerializer(serializers.ModelSerializer):

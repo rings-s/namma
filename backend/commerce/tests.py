@@ -3,6 +3,7 @@
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
+from django.test import TestCase
 from rest_framework.test import APITestCase
 
 from accounts.models import UserRole
@@ -12,6 +13,9 @@ from commerce.models import (
     GiftCardTransaction,
     Package,
     PackageItem,
+    Product,
+    Sale,
+    SaleItem,
     Service,
     StoreCreditAccount,
 )
@@ -262,3 +266,84 @@ class DynamicPricingTests(APITestCase):
         )
         price, _ = self._resolve(dj_timezone.now())
         self.assertEqual(price, Decimal("0.00"))
+
+
+class SaleStockCommitmentTests(TestCase):
+    """Stock decrements on completed sales, append-only and idempotent (#7)."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from organizations.models import Branch, Organization
+
+        cls.org = Organization.objects.create(name="Glow", slug="glow-stock")
+        cls.branch = Branch.objects.create(organization=cls.org, name="Main")
+        cls.product = Product.objects.create(
+            organization=cls.org,
+            name="Shampoo",
+            price=Decimal("30.00"),
+            stock_quantity=10,
+        )
+
+    def _sale(self, qty, status):
+        sale = Sale.objects.create(
+            organization=self.org,
+            branch=self.branch,
+            sale_number=f"S-{qty}-{status}",
+            total_amount=Decimal("30.00"),
+            status=status,
+        )
+        SaleItem.objects.create(
+            sale=sale,
+            product=self.product,
+            description="Shampoo",
+            quantity=qty,
+            unit_price=Decimal("30.00"),
+            total_price=Decimal("30.00"),
+        )
+        return sale
+
+    def test_completing_sale_decrements_stock_and_writes_movement(self):
+        from commerce.services import commit_sale_stock
+        from inventory.models import StockMovement
+
+        sale = self._sale(3, Sale.Status.COMPLETED)
+        movements = commit_sale_stock(sale)
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, 7)
+        self.assertEqual(len(movements), 1)
+        self.assertEqual(movements[0].quantity, -3)
+        self.assertEqual(
+            StockMovement.objects.filter(
+                reference_id=sale.pk,
+                movement_type=StockMovement.MovementType.SALE,
+            ).count(),
+            1,
+        )
+
+    def test_commit_is_idempotent(self):
+        from commerce.services import commit_sale_stock
+
+        sale = self._sale(2, Sale.Status.COMPLETED)
+        commit_sale_stock(sale)
+        commit_sale_stock(sale)  # second call must not deduct again
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, 8)
+
+    def test_draft_sale_does_not_move_stock(self):
+        from commerce.services import commit_sale_stock
+
+        sale = self._sale(5, Sale.Status.DRAFT)
+        self.assertEqual(commit_sale_stock(sale), [])
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, 10)
+
+    def test_overselling_is_rejected(self):
+        from django.core.exceptions import ValidationError
+
+        from commerce.services import commit_sale_stock
+
+        sale = self._sale(99, Sale.Status.COMPLETED)
+        with self.assertRaises(ValidationError):
+            commit_sale_stock(sale)
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_quantity, 10)

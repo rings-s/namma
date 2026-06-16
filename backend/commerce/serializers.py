@@ -56,7 +56,8 @@ class SaleSerializer(serializers.ModelSerializer):
     class Meta:
         model = Sale
         fields = "__all__"
-        read_only_fields = AUDIT_FIELDS
+        # sale_number is allocated server-side from DocumentSequence.
+        read_only_fields = (*AUDIT_FIELDS, "sale_number")
 
 
 class GiftCardSerializer(serializers.ModelSerializer):

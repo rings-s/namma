@@ -11,6 +11,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from communications.models import ConsentRecord
+from core.audit import record_audit
 from customers.models import (
     Customer,
     CustomerSegment,
@@ -52,12 +53,11 @@ def evaluate_segment_queryset(segment):
 
 
 @transaction.atomic
-def refresh_segment(segment):
-    """Re-evaluate one dynamic segment's membership. Idempotent — the end
-    state always equals the current criteria match, however often it runs."""
-    if segment.segment_type != CustomerSegment.SegmentType.DYNAMIC:
-        return segment
-    matching_ids = set(evaluate_segment_queryset(segment).values_list("id", flat=True))
+def converge_segment_membership(segment, matching_ids):
+    """Make ``segment``'s membership exactly ``matching_ids``. Idempotent —
+    the end state always equals the supplied set, however often it runs.
+    Shared by dynamic refresh and the AI segment pipeline."""
+    matching_ids = set(matching_ids)
     current_ids = set(segment.memberships.values_list("customer_id", flat=True))
     segment.memberships.filter(customer_id__in=current_ids - matching_ids).delete()
     CustomerSegmentMembership.objects.bulk_create(
@@ -67,6 +67,14 @@ def refresh_segment(segment):
     segment.last_refreshed_at = timezone.now()
     segment.save(update_fields=["last_refreshed_at", "updated_at"])
     return segment
+
+
+def refresh_segment(segment):
+    """Re-evaluate one dynamic segment's membership against its criteria."""
+    if segment.segment_type != CustomerSegment.SegmentType.DYNAMIC:
+        return segment
+    matching_ids = evaluate_segment_queryset(segment).values_list("id", flat=True)
+    return converge_segment_membership(segment, matching_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -189,10 +197,19 @@ def erase_customer(customer, requested_by=None):
         ]
     )
     customer.delete()  # soft delete — financial FKs stay intact
+    record_audit(
+        action="pdpl.customer_erased",
+        entity_type="Customer",
+        entity_id=customer.pk,
+        organization=customer.organization,
+        user=requested_by,
+        new_values={"label": erased_label},
+    )
     return customer
 
 
 __all__ = [
+    "converge_segment_membership",
     "erase_customer",
     "evaluate_segment_queryset",
     "export_customer_data",

@@ -26,25 +26,70 @@ from financials.services import (
 logger = get_task_logger(__name__)
 
 
-@shared_task(bind=True, max_retries=3)
+#: Webhook processing outcomes that are final — never reprocessed.
+_TERMINAL_WEBHOOK_STATUSES = (
+    PaymentWebhookEvent.ProcessingStatus.PROCESSED,
+    PaymentWebhookEvent.ProcessingStatus.IGNORED,
+)
+
+
+@shared_task(bind=True, max_retries=5)
 def process_payment_webhook_event_task(self, event_id):
-    """Process one stored, still-pending webhook event."""
-    event = PaymentWebhookEvent.objects.filter(
-        pk=event_id,
-        processing_status=PaymentWebhookEvent.ProcessingStatus.PENDING,
-    ).first()
+    """Process one stored webhook event with bounded, backed-off retries.
+
+    Reprocessing is safe: ``process_payment_webhook_event`` is idempotent (it
+    re-converges payment/invoice state under a row lock). A transient failure
+    is retried with exponential backoff; the event is only dead-lettered as
+    FAILED once retries are exhausted, where the recovery sweeper (or an
+    operator) can replay it.
+    """
+    event = (
+        PaymentWebhookEvent.objects.filter(pk=event_id)
+        .exclude(processing_status__in=_TERMINAL_WEBHOOK_STATUSES)
+        .first()
+    )
     if event is None:
         logger.info("Webhook event %s gone or already handled.", event_id)
         return
     try:
         process_payment_webhook_event(event)
     except Exception as exc:
-        PaymentWebhookEvent.objects.filter(pk=event.pk).update(
-            processing_status=PaymentWebhookEvent.ProcessingStatus.FAILED,
-            processed_at=timezone.now(),
-        )
-        logger.exception("Webhook event %s failed: %s", event_id, exc)
-        raise
+        if self.request.retries >= self.max_retries:
+            PaymentWebhookEvent.objects.filter(pk=event.pk).update(
+                processing_status=PaymentWebhookEvent.ProcessingStatus.FAILED,
+                processed_at=timezone.now(),
+            )
+            logger.exception(
+                "Webhook event %s dead-lettered after %s retries: %s",
+                event_id,
+                self.request.retries,
+                exc,
+            )
+            raise
+        raise self.retry(exc=exc, countdown=min(60 * 2**self.request.retries, 900))
+
+
+@shared_task
+def reprocess_stuck_payment_webhook_events(older_than_minutes=10, limit=500):
+    """Recovery sweep: re-enqueue payment webhook events still PENDING or
+    dead-lettered FAILED after ``older_than_minutes``. Idempotent processing
+    makes replay safe; run this periodically (Celery beat) so a transient
+    outage never permanently strands a paid payment."""
+    cutoff = timezone.now() - timezone.timedelta(minutes=older_than_minutes)
+    stuck = list(
+        PaymentWebhookEvent.objects.filter(
+            processing_status__in=(
+                PaymentWebhookEvent.ProcessingStatus.PENDING,
+                PaymentWebhookEvent.ProcessingStatus.FAILED,
+            ),
+            created_at__lte=cutoff,
+        ).values_list("pk", flat=True)[:limit]
+    )
+    for pk in stuck:
+        process_payment_webhook_event_task.delay(str(pk))
+    if stuck:
+        logger.info("Re-enqueued %d stuck payment webhook events.", len(stuck))
+    return len(stuck)
 
 
 @shared_task

@@ -14,11 +14,14 @@ UUID + hash, so at-least-once submission is safe.
 
 import base64
 import uuid as uuid_module
+from decimal import Decimal
 
 from django.core.exceptions import ValidationError
-from django.db import transaction
+from django.db import IntegrityError, transaction
+from django.db.models import Sum
 from django.utils import timezone
 
+from core.audit import record_audit
 from financials import zatca
 from financials.gateways import (
     MoyasarClient,
@@ -29,10 +32,12 @@ from financials.gateways import (
     to_halalas,
 )
 from financials.models import (
+    DocumentSequence,
     EInvoice,
     EInvoiceSubmission,
     Gateway,
     Invoice,
+    LedgerEntry,
     Payment,
     PaymentIntent,
     PaymentWebhookEvent,
@@ -40,6 +45,143 @@ from financials.models import (
     ZatcaCounter,
     ZatcaDevice,
 )
+
+# ---------------------------------------------------------------------------
+# Server-side document numbering
+# ---------------------------------------------------------------------------
+
+#: Default human-readable prefixes per document type. Overridable per sequence
+#: row (the ``prefix`` column) so tenants can brand their own numbering.
+_DEFAULT_DOCUMENT_PREFIXES = {
+    DocumentSequence.DocumentType.INVOICE: "INV",
+    DocumentSequence.DocumentType.CREDIT_NOTE: "CN",
+    DocumentSequence.DocumentType.DEBIT_NOTE: "DN",
+    DocumentSequence.DocumentType.SALE: "SALE",
+    DocumentSequence.DocumentType.BOOKING: "BKG",
+    DocumentSequence.DocumentType.TICKET: "TKT",
+    DocumentSequence.DocumentType.PURCHASE_ORDER: "PO",
+}
+
+
+@transaction.atomic
+def post_journal_entry(
+    *,
+    organization,
+    lines,
+    transaction_id=None,
+    reference_type="",
+    reference_id=None,
+    description="",
+    posted_at=None,
+):
+    """Post a balanced double-entry journal transaction.
+
+    ``lines`` is an iterable of mappings, each carrying an ``account`` (a
+    ``LedgerAccount`` of ``organization``), and exactly one of a positive
+    ``debit`` or ``credit`` (plus optional ``currency`` and ``description``).
+
+    Enforces real double-entry accounting: at least two lines, every line is
+    one-sided, a single currency, and total debits equal total credits. An
+    unbalanced or single-sided transaction is rejected — nothing is written.
+    All rows share one ``transaction_id`` and are created atomically, so the
+    journal is always internally consistent. Returns the created entries.
+    """
+    lines = list(lines)
+    if len(lines) < 2:
+        raise ValidationError("A journal transaction needs at least two lines.")
+
+    total_debit = Decimal("0")
+    total_credit = Decimal("0")
+    currencies = set()
+    for line in lines:
+        account = line["account"]
+        if account.organization_id != organization.id:
+            raise ValidationError(
+                "Every ledger account must belong to the transaction's organization."
+            )
+        debit = Decimal(line.get("debit") or 0)
+        credit = Decimal(line.get("credit") or 0)
+        if debit < 0 or credit < 0:
+            raise ValidationError("Ledger amounts cannot be negative.")
+        if (debit > 0) == (credit > 0):
+            raise ValidationError(
+                "Each ledger line must be either a debit or a credit, not both "
+                "or neither."
+            )
+        total_debit += debit
+        total_credit += credit
+        currencies.add(line.get("currency") or "SAR")
+
+    if len(currencies) > 1:
+        raise ValidationError("A journal transaction must use a single currency.")
+    if total_debit != total_credit:
+        raise ValidationError(
+            f"Unbalanced transaction: debits ({total_debit}) "
+            f"!= credits ({total_credit})."
+        )
+    if total_debit == 0:
+        raise ValidationError("A journal transaction cannot be empty.")
+
+    txn_id = transaction_id or uuid_module.uuid4()
+    posted_at = posted_at or timezone.now()
+    currency = currencies.pop()
+    entries = [
+        LedgerEntry(
+            organization=organization,
+            transaction_id=txn_id,
+            account=line["account"],
+            debit=Decimal(line.get("debit") or 0),
+            credit=Decimal(line.get("credit") or 0),
+            currency=currency,
+            description=line.get("description", "") or description,
+            reference_type=reference_type,
+            reference_id=reference_id,
+            posted_at=posted_at,
+        )
+        for line in lines
+    ]
+    return LedgerEntry.objects.bulk_create(entries)
+
+
+@transaction.atomic
+def next_document_number(*, organization, document_type, branch=None, when=None):
+    """Allocate the next gap-free, organization-scoped document number.
+
+    The per-(org, branch, type, year) counter row is locked with
+    ``select_for_update`` for the whole read-modify-write, so concurrent
+    document creation serializes and never mints a duplicate. The increment
+    shares the caller's transaction: if document creation later fails and rolls
+    back, the number is returned to the pool (gap-free).
+
+    Returns a string like ``INV-2026-00001``.
+    """
+    when = when or timezone.now()
+    year = when.year
+    lookup = {
+        "organization": organization,
+        "branch": branch,
+        "document_type": document_type,
+        "year": year,
+    }
+    sequence = DocumentSequence.objects.select_for_update().filter(**lookup).first()
+    if sequence is None:
+        # First document of the year for this scope. The unique constraint (plus
+        # the partial one covering NULL branches) makes a concurrent create
+        # raise IntegrityError; the loser re-reads the winner's row under lock.
+        try:
+            with transaction.atomic():
+                DocumentSequence.objects.create(
+                    **lookup,
+                    prefix=_DEFAULT_DOCUMENT_PREFIXES.get(document_type, ""),
+                )
+        except IntegrityError:
+            pass
+        sequence = DocumentSequence.objects.select_for_update().get(**lookup)
+    sequence.current_number += 1
+    sequence.save(update_fields=["current_number", "updated_at"])
+    prefix = sequence.prefix or _DEFAULT_DOCUMENT_PREFIXES.get(document_type, "")
+    return f"{prefix}-{year}-{sequence.current_number:05d}"
+
 
 #: Moyasar payment statuses -> local Payment statuses.
 MOYASAR_STATUS_MAP = {
@@ -60,6 +202,27 @@ def _apply_to_invoice(invoice_id, amount):
         invoice.status = Invoice.Status.PAID
         invoice.paid_at = timezone.now()
     else:
+        invoice.status = Invoice.Status.PARTIALLY_PAID
+    invoice.save(
+        update_fields=["amount_paid", "amount_due", "status", "paid_at", "updated_at"]
+    )
+
+
+def _reverse_from_invoice(invoice_id, amount):
+    """Reverse a refunded amount off its invoice under a row lock.
+
+    A refund un-pays the invoice: ``amount_paid`` drops, ``amount_due`` rises,
+    and the status falls back from PAID to PARTIALLY_PAID (or to ISSUED once
+    nothing remains paid), so the books never show a fully-paid invoice whose
+    money has been returned. Never drives ``amount_paid`` below zero.
+    """
+    invoice = Invoice.objects.select_for_update().get(pk=invoice_id)
+    invoice.amount_paid = max(invoice.amount_paid - amount, 0)
+    invoice.amount_due = invoice.total_amount - invoice.amount_paid
+    if invoice.amount_paid <= 0:
+        invoice.status = Invoice.Status.ISSUED
+        invoice.paid_at = None
+    elif invoice.amount_due > 0:
         invoice.status = Invoice.Status.PARTIALLY_PAID
     invoice.save(
         update_fields=["amount_paid", "amount_due", "status", "paid_at", "updated_at"]
@@ -114,6 +277,13 @@ def process_payment_webhook_event(event):
         payment.paid_at = timezone.now()
         if payment.invoice_id is not None:
             _apply_to_invoice(payment.invoice_id, payment.amount)
+        record_audit(
+            action="payment.completed",
+            entity_type="Payment",
+            entity_id=payment.id,
+            organization=payment.organization,
+            new_values={"amount": str(payment.amount), "currency": payment.currency},
+        )
     elif new_status == Payment.Status.REFUNDED:
         refunded = from_halalas(data.get("refunded", 0))
         payment.status = (
@@ -149,6 +319,17 @@ def validate_refund_executable(refund):
         raise ValidationError("This refund has already been processed or rejected.")
     if refund.amount > payment.amount:
         raise ValidationError("Refund amount exceeds the payment amount.")
+    # Cumulative guard: prior processed refunds plus this one must not exceed
+    # the payment. Without this, several partial refunds each <= the payment
+    # could together over-refund it.
+    already_refunded = (
+        payment.refunds.filter(status=Refund.Status.PROCESSED)
+        .exclude(pk=refund.pk)
+        .aggregate(total=Sum("amount"))["total"]
+        or 0
+    )
+    if already_refunded + refund.amount > payment.amount:
+        raise ValidationError("Cumulative refunds would exceed the payment amount.")
 
 
 def execute_moyasar_refund(refund, approver, client=None):
@@ -171,6 +352,9 @@ def execute_moyasar_refund(refund, approver, client=None):
 
     now = timezone.now()
     with transaction.atomic():
+        # Lock the payment for the whole read-modify-write so concurrent refund
+        # executions for the same payment serialize and reconcile consistently.
+        payment = Payment.objects.select_for_update().get(pk=payment.pk)
         refund.status = Refund.Status.PROCESSED
         refund.refunded_at = now
         refund.approver = approver
@@ -192,6 +376,22 @@ def execute_moyasar_refund(refund, approver, client=None):
         )
         payment.refunded_at = now
         payment.save(update_fields=["status", "refunded_at", "updated_at"])
+        # A refund un-pays the invoice: roll back its paid balance so the
+        # books don't show a fully-paid invoice whose money was returned.
+        if payment.invoice_id is not None:
+            _reverse_from_invoice(payment.invoice_id, refund.amount)
+        record_audit(
+            action="payment.refund_processed",
+            entity_type="Refund",
+            entity_id=refund.id,
+            organization=refund.organization,
+            user=approver,
+            new_values={
+                "amount": str(refund.amount),
+                "payment": str(payment.id),
+                "refund_type": refund.refund_type,
+            },
+        )
     return refund
 
 
@@ -491,7 +691,9 @@ __all__ = [
     "activate_zatca_device",
     "execute_moyasar_refund",
     "generate_e_invoice",
+    "next_document_number",
     "onboard_zatca_device",
+    "post_journal_entry",
     "process_payment_webhook_event",
     "submit_e_invoice",
     "validate_e_invoice_generable",

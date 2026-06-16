@@ -1,4 +1,5 @@
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import transaction
 from django.utils import timezone
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
@@ -6,6 +7,8 @@ from rest_framework.response import Response
 
 from accounts.models import UserRole
 from core.api import TenantScopedViewSet, require_org_role
+from financials.models import DocumentSequence
+from financials.services import next_document_number
 from inventory.models import (
     PurchaseOrder,
     PurchaseOrderLine,
@@ -55,6 +58,23 @@ class PurchaseOrderViewSet(TenantScopedViewSet):
     serializer_class = PurchaseOrderSerializer
     search_fields = ["po_number"]
     ordering_fields = ["created_at", "expected_at"]
+
+    def perform_create(self, serializer):
+        """Assign a gap-free PO number server-side; clients never supply one.
+
+        Wrapped in a transaction so ``next_document_number``'s
+        ``select_for_update`` always has one, even without an idempotency key.
+        """
+        self._check_tenant_ownership(serializer)
+        organization = serializer.validated_data["organization"]
+        with transaction.atomic():
+            serializer.save(
+                po_number=next_document_number(
+                    organization=organization,
+                    document_type=DocumentSequence.DocumentType.PURCHASE_ORDER,
+                    branch=serializer.validated_data.get("branch"),
+                )
+            )
 
     @action(detail=True, methods=["post"])
     def submit(self, request, pk=None):

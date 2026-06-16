@@ -167,7 +167,9 @@ class PurchaseOrder(BaseModel):
     supplier = models.ForeignKey(
         Supplier, on_delete=models.PROTECT, related_name="purchase_orders"
     )
-    po_number = models.CharField(max_length=50, unique=True)
+    # Unique per tenant, not globally: next_document_number mints org-scoped
+    # sequences (PO-2026-00001 restarts for each organization).
+    po_number = models.CharField(max_length=50)
     status = models.CharField(
         max_length=20, choices=Status.choices, default=Status.DRAFT
     )
@@ -181,6 +183,12 @@ class PurchaseOrder(BaseModel):
 
     class Meta:
         ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["organization", "po_number"],
+                name="uniq_po_number_per_org",
+            ),
+        ]
         indexes = [
             models.Index(fields=["organization", "status"]),
         ]

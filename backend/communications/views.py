@@ -1,6 +1,9 @@
+import hashlib
 import json
 
+from django.conf import settings
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.http import HttpResponse
 from rest_framework import generics, permissions, status
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
@@ -16,14 +19,22 @@ from communications.models import (
     MessageTemplate,
     Notification,
     NotificationTemplate,
+    WhatsAppWebhookEvent,
 )
-from communications.services import validate_email_dispatch, validate_sms_dispatch
+from communications.gateways import verify_whatsapp_signature
+from communications.services import (
+    validate_email_dispatch,
+    validate_sms_dispatch,
+    validate_whatsapp_dispatch,
+)
 from communications.sns import SNSVerificationError, verify_sns_message
 from communications.tasks import (
     confirm_sns_subscription_task,
     process_ses_event_task,
+    process_whatsapp_webhook_task,
     send_email_dispatch_task,
     send_sms_dispatch_task,
+    send_whatsapp_dispatch_task,
 )
 from core.api import TenantScopedReadOnlyViewSet, TenantScopedViewSet
 from core.models import Channel
@@ -51,6 +62,7 @@ class MessageDispatchViewSet(TenantScopedViewSet):
         routes = {
             Channel.SMS: (validate_sms_dispatch, send_sms_dispatch_task),
             Channel.EMAIL: (validate_email_dispatch, send_email_dispatch_task),
+            Channel.WHATSAPP: (validate_whatsapp_dispatch, send_whatsapp_dispatch_task),
         }
         if dispatch.channel not in routes:
             raise ValidationError(
@@ -129,6 +141,55 @@ class SESWebhookView(generics.GenericAPIView):
         )
         if created:
             process_ses_event_task.delay(str(event.pk))
+        return Response({"detail": "ok"})
+
+
+class WhatsAppWebhookView(generics.GenericAPIView):
+    """Receiver for the Meta WhatsApp Cloud API webhook.
+
+    GET performs Meta's subscription handshake — it echoes ``hub.challenge`` only
+    when ``hub.verify_token`` matches the configured token. POST authenticates
+    every payload against the app secret (``X-Hub-Signature-256``) before handing
+    delivery statuses to a worker, so the receiver answers 200 fast and Meta
+    stops retrying.
+    """
+
+    authentication_classes = []
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        verify_token = settings.WHATSAPP_WEBHOOK_VERIFY_TOKEN
+        mode = request.query_params.get("hub.mode")
+        token = request.query_params.get("hub.verify_token")
+        challenge = request.query_params.get("hub.challenge", "")
+        if mode == "subscribe" and verify_token and token == verify_token:
+            # Meta expects the raw challenge string echoed back, not JSON.
+            return HttpResponse(challenge, content_type="text/plain")
+        return HttpResponse("Verification failed", status=403)
+
+    def post(self, request):
+        if not verify_whatsapp_signature(
+            request.body, request.headers.get("X-Hub-Signature-256", "")
+        ):
+            return Response(
+                {"detail": "Invalid signature."}, status=status.HTTP_403_FORBIDDEN
+            )
+        try:
+            payload = json.loads(request.body)
+        except ValueError:
+            return Response(
+                {"detail": "Malformed payload."}, status=status.HTTP_400_BAD_REQUEST
+            )
+        # Store fast, return fast: persist the raw delivery (deduped on a body
+        # hash so Meta's retries collapse), then a worker applies it by id — the
+        # full payload never travels through the broker.
+        signature = hashlib.sha256(request.body).hexdigest()
+        event, created = WhatsAppWebhookEvent.objects.get_or_create(
+            body_signature=signature,
+            defaults={"payload": payload},
+        )
+        if created:
+            process_whatsapp_webhook_task.delay(str(event.pk))
         return Response({"detail": "ok"})
 
 

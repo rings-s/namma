@@ -55,15 +55,26 @@ class TenantScopedQuerysetMixin:
     ordering = ["-created_at"]
 
     def allowed_organization_ids(self):
-        """Org ids the user may access, or None meaning unrestricted (superuser)."""
-        user = self.request.user
-        if user.is_superuser:
-            return None
-        from accounts.models import UserRole
+        """Org ids the user may access, or None meaning unrestricted (superuser).
 
-        return list(
-            UserRole.objects.filter(user=user).values_list("organization_id", flat=True)
-        )
+        Memoized on the view instance: ``get_queryset`` and the write-ownership
+        check both need this within one request, so the ``UserRole`` lookup runs
+        once instead of per call. (None is a valid result, so the presence of the
+        attribute — not its truthiness — is the cache guard.)
+        """
+        if not hasattr(self, "_allowed_org_ids"):
+            user = self.request.user
+            if user.is_superuser:
+                self._allowed_org_ids = None
+            else:
+                from accounts.models import UserRole
+
+                self._allowed_org_ids = list(
+                    UserRole.objects.filter(user=user).values_list(
+                        "organization_id", flat=True
+                    )
+                )
+        return self._allowed_org_ids
 
     def get_queryset(self):
         queryset = super().get_queryset()

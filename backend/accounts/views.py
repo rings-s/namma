@@ -11,6 +11,8 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
 from accounts.models import TwoFactorDevice, UserRole, UserSession
+from accounts.throttling import LoginRateThrottle
+from core.audit import record_audit
 from accounts.serializers import (
     RegisterSerializer,
     TwoFactorCodeSerializer,
@@ -42,6 +44,9 @@ class TwoFactorTokenObtainPairView(TokenObtainPairView):
     """
 
     serializer_class = TwoFactorTokenObtainPairSerializer
+    # Brute-force guard: tight per-(IP, email) limit, independent of the
+    # shared anonymous bucket.
+    throttle_classes = [LoginRateThrottle]
 
     def post(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
@@ -55,6 +60,13 @@ class TwoFactorTokenObtainPairView(TokenObtainPairView):
             refresh_jti=RefreshToken(data["refresh"])["jti"],
             ip_address=_client_ip(request),
             user_agent=request.META.get("HTTP_USER_AGENT", "")[:512],
+        )
+        record_audit(
+            action="auth.login",
+            entity_type="User",
+            entity_id=serializer.user.id,
+            user=serializer.user,
+            request=request,
         )
         return Response(data, status=status.HTTP_200_OK)
 
@@ -110,6 +122,13 @@ class SessionRevokeView(generics.GenericAPIView):
             BlacklistedToken.objects.get_or_create(token=outstanding)
         session.revoked_at = timezone.now()
         session.save(update_fields=["revoked_at", "updated_at"])
+        record_audit(
+            action="auth.session_revoked",
+            entity_type="UserSession",
+            entity_id=session.id,
+            user=request.user,
+            request=request,
+        )
         return Response(UserSessionSerializer(session).data)
 
 
@@ -224,7 +243,16 @@ class UserRoleViewSet(TenantScopedViewSet):
             serializer.validated_data["organization"],
             serializer.validated_data.get("role"),
         )
-        serializer.save()
+        role = serializer.save()
+        record_audit(
+            action="rbac.role_granted",
+            entity_type="UserRole",
+            entity_id=role.id,
+            organization=role.organization,
+            user=self.request.user,
+            new_values={"target_user": str(role.user_id), "role": role.role},
+            request=self.request,
+        )
 
     def perform_update(self, serializer):
         if (
@@ -237,9 +265,29 @@ class UserRoleViewSet(TenantScopedViewSet):
             "organization", serializer.instance.organization
         )
         target_role = serializer.validated_data.get("role", serializer.instance.role)
+        old_role = serializer.instance.role
         self._check_role_management(organization, target_role)
-        serializer.save()
+        role = serializer.save()
+        record_audit(
+            action="rbac.role_updated",
+            entity_type="UserRole",
+            entity_id=role.id,
+            organization=role.organization,
+            user=self.request.user,
+            old_values={"role": old_role},
+            new_values={"target_user": str(role.user_id), "role": role.role},
+            request=self.request,
+        )
 
     def perform_destroy(self, instance):
         self._check_role_management(instance.organization)
+        record_audit(
+            action="rbac.role_revoked",
+            entity_type="UserRole",
+            entity_id=instance.id,
+            organization=instance.organization,
+            user=self.request.user,
+            old_values={"target_user": str(instance.user_id), "role": instance.role},
+            request=self.request,
+        )
         instance.delete()
