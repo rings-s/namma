@@ -6,9 +6,22 @@ dist/
 wheels/
 *.egg-info
 
+# Tooling caches & test/coverage artifacts
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.log
+
 # Virtual environments
 .venv
 .namaa
+
+# Editor / OS cruft
+.DS_Store
+Thumbs.db
+*.swp
 
 # Secrets — env files are never committed (use backend/.env.example)
 .env
