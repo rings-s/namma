@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { i18n } from '$lib/i18n/i18n.svelte.js';
 	import { toasts } from '$lib/stores/toast.svelte.js';
+	import { auth } from '$lib/stores/auth.svelte.js';
 	import {
 		listSessions,
 		revokeSession,
@@ -50,8 +51,9 @@
 	}
 
 	// --- Two-factor ---
-	// The backend exposes no 2FA status, so both flows are always available;
-	// setup returns 400 if 2FA is already enabled (see MISSING_BACKEND.md).
+	// /me/ now reports two_factor_enabled (MISSING_BACKEND #2 — resolved), so the
+	// UI shows exactly one flow: enroll when off, disable when on.
+	const twoFactorEnabled = $derived(!!auth.user?.two_factor_enabled);
 	let enrolling = $state(false);
 	let enrollSecret = $state('');
 	let enrollUri = $state('');
@@ -77,6 +79,8 @@
 		confirming = true;
 		try {
 			await verifyTwoFactor(confirmCode);
+			// Refresh /me/ so two_factor_enabled flips and the UI swaps flows.
+			await auth.loadSession();
 			toasts.success(i18n.t('security.2fa.enabledMsg'));
 			enrolling = false;
 			enrollSecret = '';
@@ -95,6 +99,7 @@
 		disabling = true;
 		try {
 			await disableTwoFactor(disableCode);
+			await auth.loadSession();
 			toasts.success(i18n.t('security.2fa.disabledMsg'));
 			disableCode = '';
 		} catch (err) {
@@ -150,9 +155,40 @@
 
 	<!-- Two-factor authentication -->
 	<section>
-		<h2 class="mb-3 text-lg font-semibold text-slate-900">{i18n.t('security.2fa')}</h2>
+		<div class="mb-3 flex items-center gap-3">
+			<h2 class="text-lg font-semibold text-slate-900">{i18n.t('security.2fa')}</h2>
+			<span
+				class="rounded-full px-2.5 py-0.5 text-xs font-semibold {twoFactorEnabled
+					? 'bg-emerald-50 text-emerald-700'
+					: 'bg-slate-100 text-slate-500'}"
+			>
+				{i18n.t(twoFactorEnabled ? 'security.2fa.enabled' : 'security.2fa.disabled')}
+			</span>
+		</div>
 		<div class="space-y-4 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-			{#if !enrolling}
+			{#if twoFactorEnabled}
+				<!-- 2FA on: only the disable flow. -->
+				<p class="text-sm text-slate-500">{i18n.t('security.2fa.codeToDisable')}</p>
+				<form onsubmit={disable} class="flex items-end gap-3">
+					<div class="flex-1">
+						<input
+							bind:value={disableCode}
+							inputmode="numeric"
+							maxlength="10"
+							placeholder="000000"
+							class="w-full rounded-lg border-slate-300 text-center tracking-[0.3em] focus:border-brand-500 focus:ring-brand-500"
+						/>
+					</div>
+					<button
+						type="submit"
+						disabled={disabling || !disableCode}
+						class="flex items-center gap-2 rounded-lg border border-rose-200 px-5 py-2.5 text-sm font-semibold text-rose-600 transition hover:bg-rose-50 disabled:opacity-60"
+					>
+						{#if disabling}<Spinner size={16} />{/if}
+						{i18n.t('security.2fa.disable')}
+					</button>
+				</form>
+			{:else if !enrolling}
 				<button
 					onclick={startEnroll}
 					class="rounded-lg bg-brand-600 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-brand-700"
@@ -197,29 +233,6 @@
 					</button>
 				</form>
 			{/if}
-
-			<div class="border-t border-slate-100 pt-4">
-				<p class="mb-2 text-sm text-slate-500">{i18n.t('security.2fa.codeToDisable')}</p>
-				<form onsubmit={disable} class="flex items-end gap-3">
-					<div class="flex-1">
-						<input
-							bind:value={disableCode}
-							inputmode="numeric"
-							maxlength="10"
-							placeholder="000000"
-							class="w-full rounded-lg border-slate-300 text-center tracking-[0.3em] focus:border-brand-500 focus:ring-brand-500"
-						/>
-					</div>
-					<button
-						type="submit"
-						disabled={disabling || !disableCode}
-						class="flex items-center gap-2 rounded-lg border border-rose-200 px-5 py-2.5 text-sm font-semibold text-rose-600 transition hover:bg-rose-50 disabled:opacity-60"
-					>
-						{#if disabling}<Spinner size={16} />{/if}
-						{i18n.t('security.2fa.disable')}
-					</button>
-				</form>
-			</div>
 		</div>
 	</section>
 </div>

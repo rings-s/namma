@@ -1,14 +1,16 @@
 /**
- * Client-side tenancy helpers. The backend scopes every list by the user's
- * role membership across ALL their organizations and exposes no
- * `?organization=` param (see MISSING_BACKEND.md), so the active-org filter
- * lives in the browser.
+ * Tenancy helpers. The active org is now scoped server-side: `resource.list`
+ * / `page` send `?organization=<id>` and `TenantScopedQuerysetMixin` honors it
+ * (MISSING_BACKEND #1 — resolved), so pagination is correct per-org. The
+ * helpers below remain as a defensive client-side guard and for resolving raw
+ * FK ids the serializers still return.
  */
 
 /**
- * Keep only rows belonging to the active organization. Rows without an
- * `organization` field pass through (they're already scoped by a parent the
- * caller loaded for one org).
+ * Defensive secondary filter: keep only rows belonging to the active org.
+ * Server-side scoping is now primary, so this is normally a no-op (every row
+ * already matches); it stays as a guard for any list fetched without the param
+ * and for rows whose serializer omits `organization`.
  * @template {{ organization?: string }} T
  * @param {T[]} rows
  * @param {string | null} orgId

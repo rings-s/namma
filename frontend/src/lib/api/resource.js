@@ -1,3 +1,4 @@
+import { auth } from '$lib/stores/auth.svelte.js';
 import { apiFetch, rows } from './client.js';
 
 /** Fresh idempotency key per mutating call (core.IdempotentCreateMixin reads it). */
@@ -5,6 +6,23 @@ function newIdempotencyKey() {
 	return (
 		globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`
 	);
+}
+
+/**
+ * Inject the active organization as a query param so the backend scopes the
+ * list server-side (`TenantScopedQuerysetMixin` honors `?organization=`). This
+ * replaces the old in-browser row filtering, so pagination is now correct
+ * per-org. The param is ignored by non-tenant endpoints (organizations,
+ * reference data). A caller that sets `organization` explicitly — including to
+ * `null`/`undefined` to opt out (e.g. the org switcher) — always wins.
+ * @param {Params} [params]
+ * @returns {Params | undefined}
+ */
+function withOrg(params) {
+	if (params && 'organization' in params) return params;
+	const orgId = auth.currentOrgId;
+	if (!orgId) return params;
+	return { ...params, organization: orgId };
 }
 
 /**
@@ -27,11 +45,11 @@ export function resource(base) {
 	return {
 		/** List rows (DRF pagination unwrapped). @param {Params} [params] @param {ReadOptions} [opts] */
 		async list(params, opts = {}) {
-			return rows(await apiFetch(root, { params, signal: opts.signal }));
+			return rows(await apiFetch(root, { params: withOrg(params), signal: opts.signal }));
 		},
 		/** Raw paginated payload `{ count, next, previous, results }`. @param {Params} [params] @param {ReadOptions} [opts] */
 		page(params, opts = {}) {
-			return apiFetch(root, { params, signal: opts.signal });
+			return apiFetch(root, { params: withOrg(params), signal: opts.signal });
 		},
 		/** @param {string} id @param {Params} [params] @param {ReadOptions} [opts] */
 		get(id, params, opts = {}) {

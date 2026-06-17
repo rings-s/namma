@@ -430,9 +430,11 @@ export const messages = {
 	'conv.replyPlaceholder': { en: 'Write a reply…', ar: 'اكتب ردًا…' },
 	'conv.sentMsg': { en: 'Reply added.', ar: 'تمت إضافة الرد.' },
 	'conv.assignTo': { en: 'Assign to', ar: 'إسناد إلى' },
+	'conv.assignedTo': { en: 'Assigned to', ar: 'مُسند إلى' },
+	'conv.unassigned': { en: 'Unassigned', ar: 'غير مُسند' },
 	'conv.assignNote': {
-		en: 'Pick a staff user ID who holds a role in this org. Names aren’t available from the API yet (see MISSING_BACKEND.md).',
-		ar: 'اختر معرّف موظف لديه دور في هذه المؤسسة. الأسماء غير متاحة من الواجهة بعد (راجع MISSING_BACKEND.md).'
+		en: 'Pick a staff member who holds a role in this organization.',
+		ar: 'اختر موظفًا لديه دور في هذه المؤسسة.'
 	},
 	'conv.dispatchInfo': {
 		en: 'Delivery: {status} · cost {cost}',

@@ -18,8 +18,9 @@ export const ROLE_RANKS = {
 /**
  * Authoritative client auth state: the signed-in user, their organization
  * roles, the organizations they can access, and the currently selected org.
- * Org selection is purely client-side — the backend scopes every queryset by
- * role membership and has no per-request org parameter.
+ * The selected org drives server-side scoping: `resource.list`/`page` send it
+ * as `?organization=` so the backend narrows each list (the browser no longer
+ * filters whole pages itself).
  *
  * @typedef {{ id: string; role: string; organization: string; branch: string | null }} Role
  * @typedef {{ id: string; name: string; slug: string; currency: string; timezone: string; logo_url: string }} Organization

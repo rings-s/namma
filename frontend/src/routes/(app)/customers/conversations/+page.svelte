@@ -57,6 +57,15 @@
 	const selected = $derived(threads.find((t) => t.id === selectedId) ?? null);
 	const currency = $derived(auth.currentOrg?.currency ?? 'SAR');
 
+	// user id → display name, from the embedded user_detail on each role
+	// (MISSING_BACKEND #4 — resolved). Lets the inbox show assignee names.
+	const staffById = $derived(
+		new Map(orgRoles.filter((r) => r.user_detail).map((r) => [r.user, r.user_detail]))
+	);
+	/** @param {string | null} userId */
+	const staffName = (userId) =>
+		(userId && staffById.get(userId)?.full_name) || i18n.t('conv.unassigned');
+
 	$effect(() => {
 		const orgId = auth.currentOrgId;
 		if (!orgId) return;
@@ -248,6 +257,8 @@
 							</p>
 							<p class="text-xs text-slate-400">
 								{selected.subject || enumLabel('channel', selected.channel)}
+								<span class="text-slate-300">·</span>
+								{i18n.t('conv.assignedTo')}: {staffName(selected.assigned_to)}
 							</p>
 						</div>
 						<div class="flex shrink-0 items-center gap-2">
@@ -346,7 +357,9 @@
 		>
 			<option value="">{i18n.t('common.none')}</option>
 			{#each orgRoles as r (r.id)}
-				<option value={r.user}>{enumLabel('role', r.role)} · {String(r.user).slice(0, 8)}</option>
+				<option value={r.user}>
+					{r.user_detail?.full_name ?? String(r.user).slice(0, 8)} · {enumLabel('role', r.role)}
+				</option>
 			{/each}
 		</select>
 		{#snippet footer()}
