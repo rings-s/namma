@@ -551,6 +551,19 @@ class EInvoice(BaseModel):
         STANDARD = "standard", "Standard"
         SIMPLIFIED = "simplified", "Simplified"
 
+    class DocumentType(models.TextChoices):
+        # Values are the ZATCA UBL InvoiceTypeCode for each document.
+        INVOICE = "invoice", "Tax Invoice"  # 388
+        CREDIT_NOTE = "credit_note", "Credit Note"  # 381
+        DEBIT_NOTE = "debit_note", "Debit Note"  # 383
+
+    #: ZATCA InvoiceTypeCode per document type.
+    ZATCA_TYPE_CODE = {
+        DocumentType.INVOICE: "388",
+        DocumentType.CREDIT_NOTE: "381",
+        DocumentType.DEBIT_NOTE: "383",
+    }
+
     class Status(models.TextChoices):
         PENDING = "pending", "Pending"
         REPORTED = "reported", "Reported"
@@ -563,8 +576,31 @@ class EInvoice(BaseModel):
         on_delete=models.CASCADE,
         related_name="e_invoices",
     )
+    # For a credit/debit note this is the *original* invoice being adjusted
+    # (the UBL BillingReference); the reversal document itself is carried by
+    # credit_note / debit_note below. All three document types share one
+    # per-device ICV/PIH chain, which is why notes reuse this table.
     invoice = models.ForeignKey(
         Invoice, on_delete=models.CASCADE, related_name="e_invoices"
+    )
+    document_type = models.CharField(
+        max_length=20,
+        choices=DocumentType.choices,
+        default=DocumentType.INVOICE,
+    )
+    credit_note = models.ForeignKey(
+        "CreditNote",
+        on_delete=models.CASCADE,
+        related_name="e_invoices",
+        null=True,
+        blank=True,
+    )
+    debit_note = models.ForeignKey(
+        "DebitNote",
+        on_delete=models.CASCADE,
+        related_name="e_invoices",
+        null=True,
+        blank=True,
     )
     zatca_device = models.ForeignKey(
         ZatcaDevice,

@@ -166,3 +166,178 @@ class DomainEventSeamTests(TestCase):
         subscribe("ai.recommendations_generated", _Boom())
         with self.captureOnCommitCallbacks(execute=True):
             publish("ai.recommendations_generated", {})  # swallowed, logged
+
+
+class DatabaseEngineCheckTests(TestCase):
+    """The core.E001 guard (audit V1): no SQLite once DEBUG is off."""
+
+    def test_sqlite_engine_is_flagged(self):
+        from core.checks import engine_errors
+
+        # The suite runs on SQLite, so the default config is the flagged case.
+        self.assertEqual([e.id for e in engine_errors()], ["core.E001"])
+
+    def test_postgres_engine_is_clean(self):
+        from core.checks import engine_errors
+
+        engine = {"default": {"ENGINE": "django.db.backends.postgresql"}}
+        with self.settings(DATABASES=engine):
+            self.assertEqual(engine_errors(), [])
+
+    def test_registered_check_is_skipped_in_debug(self):
+        from core.checks import postgres_required_outside_debug
+
+        with self.settings(DEBUG=True):
+            self.assertEqual(postgres_required_outside_debug(app_configs=None), [])
+
+
+class RetentionSweepTests(TestCase):
+    """PDPL retention worker enforces RetentionPolicy windows (audit P1)."""
+
+    @classmethod
+    def setUpTestData(cls):
+        import datetime as dt
+
+        from django.utils import timezone
+
+        from organizations.models import Organization
+
+        cls.org = Organization.objects.create(name="Ret", slug="ret")
+        cls.other = Organization.objects.create(name="Other", slug="ret-other")
+        cls.old_ts = timezone.now() - dt.timedelta(days=400)
+        cls.new_ts = timezone.now() - dt.timedelta(days=5)
+
+    def _event(self, org, when, **extra):
+        from analytics.models import AnalyticsEvent
+
+        ev = AnalyticsEvent.objects.create(
+            organization=org, event_type="page_view", **extra
+        )
+        AnalyticsEvent.objects.filter(pk=ev.pk).update(created_at=when)
+        return ev
+
+    def _policy(self, entity, days, action):
+        from organizations.models import RetentionPolicy
+
+        return RetentionPolicy.objects.create(
+            organization=self.org,
+            entity_type=entity,
+            retention_days=days,
+            action=action,
+        )
+
+    def test_delete_removes_only_expired_rows_in_the_policy_org(self):
+        from analytics.models import AnalyticsEvent
+        from core.retention import apply_policy
+        from organizations.models import RetentionPolicy
+
+        self._event(self.org, self.old_ts)
+        self._event(self.org, self.new_ts)
+        self._event(self.other, self.old_ts)  # different tenant, must survive
+
+        policy = self._policy(
+            RetentionPolicy.EntityType.ANALYTICS_EVENTS,
+            365,
+            RetentionPolicy.Action.DELETE,
+        )
+        removed = apply_policy(policy)
+
+        self.assertEqual(removed, 1)
+        self.assertEqual(
+            AnalyticsEvent.objects.filter(organization=self.org).count(), 1
+        )
+        self.assertEqual(
+            AnalyticsEvent.objects.filter(organization=self.other).count(), 1
+        )
+
+    def test_anonymize_strips_pii_but_keeps_the_row(self):
+        from django.contrib.auth import get_user_model
+
+        from analytics.models import AnalyticsEvent
+        from core.retention import apply_policy
+        from organizations.models import RetentionPolicy
+
+        user = get_user_model().objects.create_user(
+            email="ret@namaa.sa", password="pass12345"
+        )
+        self._event(
+            self.org,
+            self.old_ts,
+            user=user,
+            session_id="sess-1",
+            event_data={"ip": "x"},
+        )
+        policy = self._policy(
+            RetentionPolicy.EntityType.ANALYTICS_EVENTS,
+            365,
+            RetentionPolicy.Action.ANONYMIZE,
+        )
+        affected = apply_policy(policy)
+
+        self.assertEqual(affected, 1)
+        event = AnalyticsEvent.objects.get(organization=self.org)
+        self.assertIsNone(event.user_id)
+        self.assertEqual(event.session_id, "")
+        self.assertEqual(event.event_data, {})
+
+    def test_idempotency_records_policy_is_skipped_not_applied(self):
+        # IdempotencyRecord has no organization FK; the sweep must refuse rather
+        # than risk cross-tenant deletion.
+        from core.retention import apply_policy
+        from organizations.models import RetentionPolicy
+
+        policy = self._policy(
+            RetentionPolicy.EntityType.IDEMPOTENCY_RECORDS,
+            30,
+            RetentionPolicy.Action.DELETE,
+        )
+        self.assertEqual(apply_policy(policy), 0)
+
+    def test_anonymize_without_anonymizer_is_skipped_not_deleted(self):
+        from core.retention import apply_policy
+        from organizations.models import RetentionPolicy
+
+        policy = self._policy(
+            RetentionPolicy.EntityType.SLOT_HOLDS,
+            1,
+            RetentionPolicy.Action.ANONYMIZE,
+        )
+        self.assertEqual(apply_policy(policy), 0)  # no anonymizer -> no-op
+
+
+class WebhookBodyLimitTests(TestCase):
+    """Unauthenticated webhook receivers reject oversized bodies (audit P1)."""
+
+    def test_oversized_body_is_rejected_with_413(self):
+        # Declared Content-Length over the cap is refused before the body is read.
+        oversized = "x" * (256 * 1024 + 1)
+        response = self.client.post(
+            "/api/v1/webhooks/ses/",
+            data=oversized,
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 413)
+
+    def test_small_body_passes_the_limit_check(self):
+        # A tiny malformed payload gets past the size gate and is handled by the
+        # view (400 for bad JSON / 403 for bad signature), never 413.
+        response = self.client.post(
+            "/api/v1/webhooks/ses/",
+            data="{}",
+            content_type="application/json",
+        )
+        self.assertNotEqual(response.status_code, 413)
+
+
+class RequestIDMiddlewareTests(TestCase):
+    """Correlation id plumbing (audit V3)."""
+
+    def test_response_carries_a_request_id(self):
+        response = self.client.get("/api/v1/services/")  # 401, but still tagged
+        self.assertTrue(response.headers.get("X-Request-ID"))
+
+    def test_upstream_request_id_is_honoured(self):
+        response = self.client.get(
+            "/api/v1/services/", HTTP_X_REQUEST_ID="trace-abc-123"
+        )
+        self.assertEqual(response.headers.get("X-Request-ID"), "trace-abc-123")

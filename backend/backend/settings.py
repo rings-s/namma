@@ -14,9 +14,18 @@ import os
 import secrets
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
+
+
+def _env_csv(name):
+    """Comma-separated env var -> list of trimmed, non-empty values."""
+    return [
+        item.strip() for item in os.environ.get(name, "").split(",") if item.strip()
+    ]
+
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -42,9 +51,7 @@ if not SECRET_KEY:
     if DEBUG:
         SECRET_KEY = "django-insecure-" + secrets.token_urlsafe(50)
     else:
-        raise ImproperlyConfigured(
-            "DJANGO_SECRET_KEY must be set when DEBUG is off."
-        )
+        raise ImproperlyConfigured("DJANGO_SECRET_KEY must be set when DEBUG is off.")
 
 ALLOWED_HOSTS = [
     host.strip()
@@ -66,6 +73,8 @@ INSTALLED_APPS = [
     "rest_framework",
     "rest_framework_simplejwt",
     "rest_framework_simplejwt.token_blacklist",
+    "corsheaders",
+    "drf_spectacular",
     # Namaa apps
     "core",
     "accounts",
@@ -85,15 +94,20 @@ INSTALLED_APPS = [
 AUTH_USER_MODEL = "accounts.User"
 
 REST_FRAMEWORK = {
+    # Production is token/key only. JWT for the SPA, API keys for machine
+    # integrations. SessionAuthentication is appended in DEBUG below purely for
+    # the browsable API — keeping it out of production removes the cookie-auth
+    # (and CSRF) surface for the cross-origin SvelteKit SPA, which is JWT-only.
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework_simplejwt.authentication.JWTAuthentication",
-        "rest_framework.authentication.SessionAuthentication",
+        "integrations.authentication.APIKeyAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
     ],
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 50,
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "DEFAULT_FILTER_BACKENDS": [
         "rest_framework.filters.SearchFilter",
         "rest_framework.filters.OrderingFilter",
@@ -116,6 +130,15 @@ REST_FRAMEWORK = {
     },
 }
 
+SPECTACULAR_SETTINGS = {
+    "TITLE": "Namaa API",
+    "DESCRIPTION": "Multi-tenant SaaS API for GCC service businesses.",
+    "VERSION": "1.0.0",
+    # The schema doc is served separately; don't advertise it as an endpoint.
+    "SERVE_INCLUDE_SCHEMA": False,
+    "SCHEMA_PATH_PREFIX": "/api/v1",
+}
+
 if DEBUG:  # local runs and the test suite share one client IP
     REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"] = {
         "anon": "10000/min",
@@ -123,6 +146,10 @@ if DEBUG:  # local runs and the test suite share one client IP
         # Kept tight even in DEBUG so the brute-force guard stays testable.
         "login": os.environ.get("API_THROTTLE_LOGIN", "5/min"),
     }
+    # The browsable API needs a session login; only enable it in DEBUG.
+    REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"].append(
+        "rest_framework.authentication.SessionAuthentication"
+    )
 
 # JWT auth (djangorestframework-simplejwt). Lifetimes/keys come from env in
 # production; the defaults below are development values.
@@ -256,6 +283,8 @@ CELERY_TASK_EAGER_PROPAGATES = True
 # re-enqueue webhook events that are still pending or were dead-lettered after
 # retries, so a transient outage never permanently strands a paid payment or a
 # delivery/bounce receipt. Processing is idempotent, so replay is safe.
+from celery.schedules import crontab  # noqa: E402
+
 CELERY_BEAT_SCHEDULE = {
     "reprocess-stuck-payment-webhooks": {
         "task": "financials.tasks.reprocess_stuck_payment_webhook_events",
@@ -265,10 +294,28 @@ CELERY_BEAT_SCHEDULE = {
         "task": "communications.tasks.reprocess_stuck_ses_events",
         "schedule": 300.0,
     },
+    # Nightly daily-metric roll-up. Fires at 00:15 UTC = 03:15 Asia/Riyadh, by
+    # which point the previous day is closed in GCC timezones; the task rolls
+    # up "yesterday" and is idempotent, so a missed run is recovered on rerun.
+    "roll-up-daily-metrics": {
+        "task": "analytics.tasks.roll_up_daily_metrics_task",
+        "schedule": crontab(hour=0, minute=15),
+    },
+    # PDPL retention sweep: enforce per-tenant RetentionPolicy windows daily.
+    # Idempotent (delete by created_at cutoff, anonymize only unscrubbed rows).
+    "run-retention-sweep": {
+        "task": "core.tasks.run_retention_sweep_task",
+        "schedule": crontab(hour=1, minute=0),
+    },
 }
 
 MIDDLEWARE = [
+    # First, so every log line (incl. errors raised downstream) is correlated.
+    "core.middleware.RequestIDMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    # CORS must precede CommonMiddleware so headers are applied even on the
+    # redirects/responses CommonMiddleware can short-circuit.
+    "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -299,13 +346,80 @@ WSGI_APPLICATION = "backend.wsgi.application"
 
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
+#
+# Driven by DATABASE_URL so the planned PostgreSQL cutover is a config change,
+# not a code change. Unset = SQLite at db.sqlite3 for local dev (the historical
+# default). The core.E001 system check (core/checks.py) refuses to start with a
+# non-PostgreSQL engine when DEBUG is off, because select_for_update() — relied
+# on by document numbering, the ledger, stock and the ZATCA ICV chain — is a
+# no-op on SQLite. CONN_MAX_AGE enables persistent connections under real DBs.
+CONN_MAX_AGE = int(os.environ.get("DB_CONN_MAX_AGE", "0"))
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+
+def _database_config(url):
+    """Parse a DATABASE_URL into a Django DATABASES['default'] mapping.
+
+    Supports ``sqlite://`` (dev fallback) and ``postgres://`` / ``postgresql://``.
+    Any other scheme is rejected loudly rather than silently degrading.
+    """
+    if not url:
+        return {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "db.sqlite3",
+        }
+    parsed = urlsplit(url)
+    scheme = parsed.scheme.lower()
+    if scheme == "sqlite":
+        # sqlite:///relative or sqlite:////absolute (dj-database-url convention);
+        # bare sqlite:// falls back to the default file.
+        name = parsed.path or ""
+        return {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": name.lstrip("/") or str(BASE_DIR / "db.sqlite3"),
+        }
+    if scheme in ("postgres", "postgresql"):
+        config = {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": unquote(parsed.path.lstrip("/")),
+            "USER": unquote(parsed.username or ""),
+            "PASSWORD": unquote(parsed.password or ""),
+            "HOST": unquote(parsed.hostname or ""),
+            "PORT": str(parsed.port or ""),
+            "CONN_MAX_AGE": CONN_MAX_AGE,
+        }
+        sslmode = os.environ.get("DB_SSLMODE")
+        if sslmode:
+            config["OPTIONS"] = {"sslmode": sslmode}
+        return config
+    raise ImproperlyConfigured(
+        f"Unsupported DATABASE_URL scheme: {scheme!r}. Use sqlite or postgres."
+    )
+
+
+DATABASES = {"default": _database_config(os.environ.get("DATABASE_URL", ""))}
+
+
+# Caching (audit gap V2)
+# Shared cache so DRF throttling (incl. the login brute-force guard) and the SNS
+# signing-cert cache hold across Gunicorn/Celery workers. Set REDIS_CACHE_URL in
+# production; DEBUG falls back to per-process LocMemCache (fine for single-process
+# dev and the test suite). Off DEBUG with no cache URL fails closed rather than
+# silently giving every worker its own un-shared rate-limit counters.
+REDIS_CACHE_URL = os.environ.get("REDIS_CACHE_URL", "")
+if REDIS_CACHE_URL:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": REDIS_CACHE_URL,
+        }
     }
-}
+elif DEBUG:
+    CACHES = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}}
+else:
+    raise ImproperlyConfigured(
+        "REDIS_CACHE_URL must be set when DEBUG is off so throttle counters and "
+        "the SNS signing-cert cache are shared across workers."
+    )
 
 
 # Password validation
@@ -327,6 +441,17 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 
+# Hard backstop for in-memory request bodies (non-file POST data). Accessing
+# request.body / request.data beyond this raises RequestDataTooBig -> HTTP 400.
+# Webhook receivers advertise a far tighter per-view cap (WebhookBodyLimitMixin);
+# this protects every other JSON endpoint from memory-exhaustion payloads. File
+# uploads are governed separately by FILE_UPLOAD_MAX_MEMORY_SIZE and stream to
+# disk, so this does not constrain document/image uploads.
+DATA_UPLOAD_MAX_MEMORY_SIZE = int(
+    os.environ.get("DATA_UPLOAD_MAX_MEMORY_SIZE", 2 * 1024 * 1024)
+)
+
+
 # Internationalization
 # https://docs.djangoproject.com/en/6.0/topics/i18n/
 
@@ -343,3 +468,84 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = "static/"
+
+
+# ---------------------------------------------------------------------------
+# CORS & CSRF (audit gap V5)
+# ---------------------------------------------------------------------------
+# The SvelteKit SPA is a separate origin. Allow only the configured frontend
+# origin(s); never use CORS_ALLOW_ALL_ORIGINS. Credentials are on so the SPA may
+# send cookies for the browsable API in dev; production auth is the JWT bearer
+# header, which CORS permits to any allowed origin regardless.
+CORS_ALLOWED_ORIGINS = _env_csv("CORS_ALLOWED_ORIGINS")
+CORS_ALLOW_CREDENTIALS = True
+# Echo the correlation id so the SPA can surface it in bug reports.
+CORS_EXPOSE_HEADERS = ["X-Request-ID"]
+
+# Origins trusted for unsafe (cookie/session) requests — the admin and the
+# browsable API. Must include scheme.
+CSRF_TRUSTED_ORIGINS = _env_csv("CSRF_TRUSTED_ORIGINS")
+
+
+# ---------------------------------------------------------------------------
+# Production security hardening (audit gap V5) — active only when DEBUG is off
+# ---------------------------------------------------------------------------
+if not DEBUG:
+    SECURE_SSL_REDIRECT = os.environ.get("SECURE_SSL_REDIRECT", "true").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    # Honour the proxy's forwarded-proto so SSL redirect/secure cookies work
+    # behind TLS-terminating load balancers.
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = int(os.environ.get("SECURE_HSTS_SECONDS", "31536000"))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    SESSION_COOKIE_HTTPONLY = True
+    CSRF_COOKIE_HTTPONLY = True
+    X_FRAME_OPTIONS = "DENY"
+
+
+# ---------------------------------------------------------------------------
+# Logging (audit gap V3)
+# ---------------------------------------------------------------------------
+# Structured, request-correlated application logging. Complements — does not
+# duplicate — the business-event trail in core.models.AuditLog/AccessLog. Every
+# line carries the X-Request-ID set by core.middleware.RequestIDMiddleware.
+LOG_LEVEL = os.environ.get("DJANGO_LOG_LEVEL", "INFO").upper()
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "filters": {
+        "request_id": {"()": "core.logging.RequestIDFilter"},
+    },
+    "formatters": {
+        "structured": {
+            "format": (
+                "%(asctime)s %(levelname)s %(name)s req=%(request_id)s %(message)s"
+            ),
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "filters": ["request_id"],
+            "formatter": "structured",
+        },
+    },
+    "root": {"handlers": ["console"], "level": LOG_LEVEL},
+    "loggers": {
+        "django": {"handlers": ["console"], "level": LOG_LEVEL, "propagate": False},
+        # Access-log noise is already covered by the proxy; keep request handling
+        # at WARNING so application logs stay signal-heavy.
+        "django.request": {
+            "handlers": ["console"],
+            "level": "WARNING",
+            "propagate": False,
+        },
+    },
+}

@@ -1,6 +1,7 @@
 import hmac
 
 from django.conf import settings
+from drf_spectacular.utils import extend_schema
 from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import generics, mixins, permissions, status, viewsets
 from rest_framework.decorators import action
@@ -12,11 +13,16 @@ from core.api import (
     TenantScopedQuerysetMixin,
     TenantScopedReadOnlyViewSet,
     TenantScopedViewSet,
+    WebhookBodyLimitMixin,
+    ZatcaImmutableMixin,
     require_org_role,
+    require_org_roles,
 )
 from financials import serializers
 from financials.models import Gateway
 from financials.services import (
+    issue_credit_note,
+    issue_debit_note,
     next_document_number,
     post_journal_entry,
     validate_e_invoice_generable,
@@ -27,6 +33,7 @@ from financials.tasks import (
     activate_zatca_device_task,
     execute_moyasar_refund_task,
     generate_and_submit_e_invoice_task,
+    generate_and_submit_note_task,
     onboard_zatca_device_task,
     process_payment_webhook_event_task,
 )
@@ -61,11 +68,26 @@ class DocumentSequenceViewSet(TenantScopedViewSet):
     serializer_class = serializers.DocumentSequenceSerializer
 
 
-class InvoiceViewSet(TenantScopedViewSet):
+#: Issuing a ZATCA reversal is an accounting action. Gated by explicit role
+#: membership (NOT rank): Accountant and Marketer share rank 40, so a rank floor
+#: at "accountant" would wrongly admit Marketers. Superusers still pass (via
+#: require_org_roles' platform escape hatch).
+REVERSAL_ROLES = (
+    UserRole.Role.ACCOUNTANT,
+    UserRole.Role.MANAGER,
+    UserRole.Role.ADMIN,
+    UserRole.Role.OWNER,
+)
+
+
+class InvoiceViewSet(ZatcaImmutableMixin, TenantScopedViewSet):
     queryset = Invoice.objects.select_related("customer", "sale")
     serializer_class = serializers.InvoiceSerializer
     search_fields = ["invoice_number"]
     ordering_fields = ["issued_at", "due_date", "total_amount", "created_at"]
+
+    def zatca_locked_invoice(self, instance):
+        return instance
 
     def perform_create(self, serializer):
         self._check_tenant_ownership(serializer)
@@ -76,6 +98,18 @@ class InvoiceViewSet(TenantScopedViewSet):
                 document_type=_DocumentSequence.DocumentType.INVOICE,
             )
         )
+
+    def _active_device(self, invoice, device_id):
+        devices = ZatcaDevice.objects.filter(
+            organization_id=invoice.organization_id,
+            status=ZatcaDevice.Status.ACTIVE,
+        )
+        device = devices.filter(pk=device_id).first() if device_id else devices.first()
+        if device is None:
+            raise ValidationError(
+                "No active ZATCA device is available for this organization."
+            )
+        return device
 
     @action(detail=True, methods=["post"], url_path="einvoice")
     def einvoice(self, request, pk=None):
@@ -88,16 +122,7 @@ class InvoiceViewSet(TenantScopedViewSet):
         require_org_role(
             request.user, invoice.organization_id, UserRole.Role.ACCOUNTANT
         )
-        device_id = request.data.get("zatca_device")
-        devices = ZatcaDevice.objects.filter(
-            organization_id=invoice.organization_id,
-            status=ZatcaDevice.Status.ACTIVE,
-        )
-        device = devices.filter(pk=device_id).first() if device_id else devices.first()
-        if device is None:
-            raise ValidationError(
-                "No active ZATCA device is available for this organization."
-            )
+        device = self._active_device(invoice, request.data.get("zatca_device"))
         try:
             validate_e_invoice_generable(invoice, device)
         except DjangoValidationError as exc:
@@ -105,35 +130,74 @@ class InvoiceViewSet(TenantScopedViewSet):
         generate_and_submit_e_invoice_task.delay(str(invoice.pk), str(device.pk))
         return Response({"detail": "queued"}, status=status.HTTP_202_ACCEPTED)
 
+    def _issue_reversal(self, request, *, is_credit):
+        invoice = self.get_object()
+        require_org_roles(request.user, invoice.organization_id, REVERSAL_ROLES)
+        params = serializers.ReversalRequestSerializer(data=request.data)
+        params.is_valid(raise_exception=True)
+        data = params.validated_data
+        device = self._active_device(invoice, data.get("zatca_device"))
+        try:
+            if is_credit:
+                note = issue_credit_note(
+                    invoice=invoice,
+                    amount=data.get("amount"),
+                    full=data.get("full", False),
+                    reason_code=data.get("reason_code", ""),
+                    reason_text=data.get("reason_text", ""),
+                )
+                document_type = EInvoice.DocumentType.CREDIT_NOTE
+                out = serializers.CreditNoteSerializer(note)
+            else:
+                note = issue_debit_note(
+                    invoice=invoice,
+                    amount=data["amount"],
+                    reason_code=data.get("reason_code", ""),
+                    reason_text=data.get("reason_text", ""),
+                )
+                document_type = EInvoice.DocumentType.DEBIT_NOTE
+                out = serializers.DebitNoteSerializer(note)
+        except DjangoValidationError as exc:
+            raise ValidationError(exc.messages)
+        generate_and_submit_note_task.delay(
+            str(note.pk), document_type, str(device.pk), data.get("invoice_type") or ""
+        )
+        return Response(out.data, status=status.HTTP_202_ACCEPTED)
 
-class CreditNoteViewSet(TenantScopedViewSet):
+    @action(detail=True, methods=["post"], url_path="credit-note")
+    def credit_note(self, request, pk=None):
+        """Reverse this invoice via a ZATCA credit note (381) — full or partial.
+
+        The invoice itself is never mutated. Body: ``full`` (bool) or ``amount``
+        (VAT-inclusive), plus ``reason_code``/``reason_text``. Roles: Accountant,
+        Manager, Admin or Owner.
+        """
+        return self._issue_reversal(request, is_credit=True)
+
+    @action(detail=True, methods=["post"], url_path="debit-note")
+    def debit_note(self, request, pk=None):
+        """Add a ZATCA debit note (383) charge against this invoice.
+
+        Body: ``amount`` (VAT-inclusive), ``reason_code``/``reason_text``.
+        Roles: Accountant, Manager, Admin or Owner.
+        """
+        return self._issue_reversal(request, is_credit=False)
+
+
+class CreditNoteViewSet(TenantScopedReadOnlyViewSet):
+    # Read-only history. Issuance flows through Invoice's `credit-note` action,
+    # which enforces the over-credit guard and runs the ZATCA pipeline; direct
+    # creation here would bypass both.
     queryset = CreditNote.objects.select_related("original_invoice")
     serializer_class = serializers.CreditNoteSerializer
     search_fields = ["credit_note_number"]
 
-    def perform_create(self, serializer):
-        self._check_tenant_ownership(serializer)
-        serializer.save(
-            credit_note_number=next_document_number(
-                organization=serializer.validated_data["organization"],
-                document_type=_DocumentSequence.DocumentType.CREDIT_NOTE,
-            )
-        )
 
-
-class DebitNoteViewSet(TenantScopedViewSet):
+class DebitNoteViewSet(TenantScopedReadOnlyViewSet):
+    # Read-only history; issuance flows through Invoice's `debit-note` action.
     queryset = DebitNote.objects.select_related("original_invoice")
     serializer_class = serializers.DebitNoteSerializer
     search_fields = ["debit_note_number"]
-
-    def perform_create(self, serializer):
-        self._check_tenant_ownership(serializer)
-        serializer.save(
-            debit_note_number=next_document_number(
-                organization=serializer.validated_data["organization"],
-                document_type=_DocumentSequence.DocumentType.DEBIT_NOTE,
-            )
-        )
 
 
 class PaymentIntentViewSet(TenantScopedViewSet):
@@ -169,7 +233,7 @@ class RefundViewSet(TenantScopedViewSet):
         )
 
 
-class MoyasarWebhookView(generics.GenericAPIView):
+class MoyasarWebhookView(WebhookBodyLimitMixin, generics.GenericAPIView):
     """Receiver for Moyasar webhook deliveries.
 
     Validates the shared secret token (constant-time), stores the event
@@ -180,6 +244,7 @@ class MoyasarWebhookView(generics.GenericAPIView):
     authentication_classes = []
     permission_classes = [permissions.AllowAny]
 
+    @extend_schema(exclude=True)  # gateway-facing, not part of the public contract
     def post(self, request):
         secret = settings.MOYASAR_WEBHOOK_SECRET
         token = str(request.data.get("secret_token", ""))

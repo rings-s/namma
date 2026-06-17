@@ -32,6 +32,8 @@ from financials.gateways import (
     to_halalas,
 )
 from financials.models import (
+    CreditNote,
+    DebitNote,
     DocumentSequence,
     EInvoice,
     EInvoiceSubmission,
@@ -506,8 +508,11 @@ def generate_e_invoice(invoice, device, invoice_type=None):
     """
 
     def existing_e_invoice():
+        # Scope to the invoice's own tax-invoice document: credit/debit notes
+        # also hang off invoice.e_invoices but must never be mistaken for it.
         return (
-            invoice.e_invoices.exclude(status=EInvoice.Status.FAILED)
+            invoice.e_invoices.filter(document_type=EInvoice.DocumentType.INVOICE)
+            .exclude(status=EInvoice.Status.FAILED)
             .order_by("created_at")
             .first()
         )
@@ -537,17 +542,37 @@ def generate_e_invoice(invoice, device, invoice_type=None):
         zatca_device=device,
         uuid=str(uuid_module.uuid4()),
         invoice_type=invoice_type,
+        document_type=EInvoice.DocumentType.INVOICE,
         previous_invoice_hash=previous_hash,
         icv=icv,
         status=EInvoice.Status.PENDING,
     )
     xml = zatca.build_invoice_xml(e_invoice)
-    invoice_hash = zatca.compute_invoice_hash(xml)
     issued_at = invoice.issued_at or invoice.created_at
-    organization = invoice.organization
+    return _finalize_e_invoice(
+        e_invoice,
+        xml,
+        device,
+        counter,
+        icv,
+        issued_at=issued_at,
+        total_with_vat=invoice.total_amount,
+        vat_amount=invoice.tax_amount,
+    )
 
+
+def _finalize_e_invoice(
+    e_invoice, xml, device, counter, icv, *, issued_at, total_with_vat, vat_amount
+):
+    """Hash, stamp/QR and persist a generated document, then advance the chain.
+
+    Shared by tax-invoice and credit/debit-note generation so the ZATCA
+    security steps and ICV/PIH advancement can never diverge between them.
+    """
+    organization = e_invoice.organization
+    invoice_hash = zatca.compute_invoice_hash(xml)
     signature_b64 = None
-    if invoice_type == EInvoice.InvoiceType.SIMPLIFIED:
+    if e_invoice.invoice_type == EInvoice.InvoiceType.SIMPLIFIED:
         private_key = zatca.private_key_from_pem(
             zatca.decrypt_secret(device.private_key_encrypted)
         )
@@ -558,22 +583,22 @@ def generate_e_invoice(invoice, device, invoice_type=None):
             seller_name=organization.name,
             vat_number=organization.vat_number,
             timestamp=issued_at,
-            total_with_vat=invoice.total_amount,
-            vat_amount=invoice.tax_amount,
+            total_with_vat=total_with_vat,
+            vat_amount=vat_amount,
             invoice_hash=invoice_hash,
             signature_b64=signature_b64,
             public_key_der=zatca.certificate_public_key_der(device.certificate),
             certificate_signature=zatca.certificate_signature_bytes(device.certificate),
         )
     else:
-        # Standard invoices are cleared (and stamped) by ZATCA; until the
+        # Standard documents are cleared (and stamped) by ZATCA; until the
         # cleared XML comes back the QR carries the base tags only.
         qr_b64 = zatca.build_qr_tlv(
             seller_name=organization.name,
             vat_number=organization.vat_number,
             timestamp=issued_at,
-            total_with_vat=invoice.total_amount,
-            vat_amount=invoice.tax_amount,
+            total_with_vat=total_with_vat,
+            vat_amount=vat_amount,
             invoice_hash=invoice_hash,
         )
     xml = zatca.embed_qr(xml, qr_b64)
@@ -588,6 +613,164 @@ def generate_e_invoice(invoice, device, invoice_type=None):
     counter.last_invoice_hash = invoice_hash
     counter.save(update_fields=["current_icv", "last_invoice_hash", "updated_at"])
     return e_invoice
+
+
+# ---------------------------------------------------------------------------
+# Credit / Debit note issuance + ZATCA reversal pipeline
+# ---------------------------------------------------------------------------
+
+_LIVE_EINVOICE_STATUSES = (
+    EInvoice.Status.PENDING,
+    EInvoice.Status.REPORTED,
+    EInvoice.Status.CLEARED,
+)
+
+
+def invoice_has_live_e_invoice(invoice):
+    """True if the invoice's own tax-invoice is in the ZATCA chain (not
+    rejected/failed) — i.e. it is reported/cleared (or pending) and therefore
+    immutable: corrections go through a credit note, never mutation."""
+    return invoice.e_invoices.filter(
+        document_type=EInvoice.DocumentType.INVOICE,
+        status__in=_LIVE_EINVOICE_STATUSES,
+    ).exists()
+
+
+def _credited_total(invoice):
+    return invoice.credit_notes.exclude(status=CreditNote.Status.VOID).aggregate(
+        total=Sum("amount")
+    )["total"] or Decimal("0")
+
+
+def validate_reversal_issuable(invoice, amount, *, is_credit):
+    """Cheap, local preconditions for issuing a credit/debit note."""
+    if Decimal(amount) <= 0:
+        raise ValidationError("The reversal amount must be positive.")
+    if not invoice_has_live_e_invoice(invoice):
+        raise ValidationError(
+            "The original invoice has no reported ZATCA e-invoice to reverse."
+        )
+    if is_credit:
+        # Append-only money guarantee: cumulative credits can never exceed the
+        # invoice total. A full reversal plus more is rejected, not clamped.
+        remaining = Decimal(invoice.total_amount) - _credited_total(invoice)
+        if Decimal(amount) > remaining:
+            raise ValidationError(
+                f"Credit notes would exceed the invoice total "
+                f"(remaining creditable: {remaining})."
+            )
+
+
+@transaction.atomic
+def issue_credit_note(
+    *, invoice, amount=None, reason_code="", reason_text="", full=False
+):
+    """Issue a credit note (full or partial reversal) against an invoice.
+
+    The credit note is the ZATCA-compliant way to reverse a reported invoice;
+    the invoice itself is never mutated. Append-only: once issued, the row is
+    immutable and counts against the invoice's creditable balance.
+    """
+    amount = Decimal(invoice.total_amount) if full else Decimal(amount)
+    validate_reversal_issuable(invoice, amount, is_credit=True)
+    number = next_document_number(
+        organization=invoice.organization,
+        document_type=DocumentSequence.DocumentType.CREDIT_NOTE,
+    )
+    return CreditNote.objects.create(
+        organization=invoice.organization,
+        original_invoice=invoice,
+        credit_note_number=number,
+        amount=amount,
+        reason_code=reason_code,
+        reason_text=reason_text,
+        status=CreditNote.Status.ISSUED,
+        issued_at=timezone.now(),
+    )
+
+
+@transaction.atomic
+def issue_debit_note(*, invoice, amount, reason_code="", reason_text=""):
+    """Issue a debit note (an additional charge) against a reported invoice."""
+    amount = Decimal(amount)
+    validate_reversal_issuable(invoice, amount, is_credit=False)
+    number = next_document_number(
+        organization=invoice.organization,
+        document_type=DocumentSequence.DocumentType.DEBIT_NOTE,
+    )
+    return DebitNote.objects.create(
+        organization=invoice.organization,
+        original_invoice=invoice,
+        debit_note_number=number,
+        amount=amount,
+        reason_code=reason_code,
+        reason_text=reason_text,
+        status=DebitNote.Status.ISSUED,
+        issued_at=timezone.now(),
+    )
+
+
+@transaction.atomic
+def generate_note_e_invoice(note, device, *, document_type, invoice_type=None):
+    """Create the signed, QR-coded EInvoice for a credit/debit note.
+
+    Idempotent on the note (not the invoice), so retries never burn a second
+    ICV. Shares the per-device ICV/PIH chain with tax invoices — a credit note
+    is the next link in the same chain, exactly as ZATCA requires.
+    """
+    is_credit = document_type == EInvoice.DocumentType.CREDIT_NOTE
+    note_field = "credit_note" if is_credit else "debit_note"
+    original_invoice = note.original_invoice
+
+    def existing():
+        return (
+            EInvoice.objects.filter(**{note_field: note})
+            .exclude(status=EInvoice.Status.FAILED)
+            .order_by("created_at")
+            .first()
+        )
+
+    found = existing()
+    if found is not None:
+        return found
+
+    validate_e_invoice_generable(original_invoice, device)
+    invoice_type = invoice_type or EInvoice.InvoiceType.SIMPLIFIED
+
+    counter, _ = ZatcaCounter.objects.select_for_update().get_or_create(
+        zatca_device=device
+    )
+    found = existing()
+    if found is not None:
+        return found
+    icv = counter.current_icv + 1
+    previous_hash = counter.last_invoice_hash or zatca.INITIAL_PREVIOUS_INVOICE_HASH
+
+    e_invoice = EInvoice(
+        organization=note.organization,
+        invoice=original_invoice,
+        zatca_device=device,
+        uuid=str(uuid_module.uuid4()),
+        invoice_type=invoice_type,
+        document_type=document_type,
+        previous_invoice_hash=previous_hash,
+        icv=icv,
+        status=EInvoice.Status.PENDING,
+        **{note_field: note},
+    )
+    xml = zatca.build_credit_debit_note_xml(e_invoice)
+    net = (Decimal(note.amount) / Decimal("1.15")).quantize(Decimal("0.01"))
+    issued_at = note.issued_at or note.created_at
+    return _finalize_e_invoice(
+        e_invoice,
+        xml,
+        device,
+        counter,
+        icv,
+        issued_at=issued_at,
+        total_with_vat=note.amount,
+        vat_amount=Decimal(note.amount) - net,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -691,10 +874,15 @@ __all__ = [
     "activate_zatca_device",
     "execute_moyasar_refund",
     "generate_e_invoice",
+    "generate_note_e_invoice",
+    "invoice_has_live_e_invoice",
+    "issue_credit_note",
+    "issue_debit_note",
     "next_document_number",
     "onboard_zatca_device",
     "post_journal_entry",
     "process_payment_webhook_event",
     "submit_e_invoice",
     "validate_e_invoice_generable",
+    "validate_reversal_issuable",
 ]

@@ -41,16 +41,35 @@ from commerce.serializers import (
     StoreCreditAdjustSerializer,
     StoreCreditTransactionSerializer,
 )
-from core.api import TenantScopedReadOnlyViewSet, TenantScopedViewSet, require_org_role
+from core.api import (
+    OrgRoleWriteGateMixin,
+    TenantScopedReadOnlyViewSet,
+    TenantScopedViewSet,
+    ZatcaImmutableMixin,
+    require_org_role,
+)
 
 
-class ServiceCategoryViewSet(TenantScopedViewSet):
+def _invoice_of_sale(sale):
+    """The invoice bound to a sale (OneToOne reverse), or None."""
+    from django.core.exceptions import ObjectDoesNotExist
+
+    try:
+        return sale.invoice
+    except ObjectDoesNotExist:
+        return None
+
+
+class ServiceCategoryViewSet(OrgRoleWriteGateMixin, TenantScopedViewSet):
+    # Catalog writes are Owner-only (P2); any tenant member may read.
+    write_min_role = UserRole.Role.OWNER
     queryset = ServiceCategory.objects.all()
     serializer_class = ServiceCategorySerializer
     search_fields = ["name"]
 
 
-class ServiceViewSet(TenantScopedViewSet):
+class ServiceViewSet(OrgRoleWriteGateMixin, TenantScopedViewSet):
+    write_min_role = UserRole.Role.OWNER
     queryset = Service.objects.select_related("category")
     serializer_class = ServiceSerializer
     search_fields = ["name"]
@@ -64,13 +83,16 @@ class ProductViewSet(TenantScopedViewSet):
     ordering_fields = ["price", "stock_quantity", "created_at"]
 
 
-class SaleViewSet(TenantScopedViewSet):
+class SaleViewSet(ZatcaImmutableMixin, TenantScopedViewSet):
     queryset = Sale.objects.select_related(
         "customer", "employee", "branch"
     ).prefetch_related("items")
     serializer_class = SaleSerializer
     search_fields = ["sale_number"]
     ordering_fields = ["created_at", "total_amount"]
+
+    def zatca_locked_invoice(self, instance):
+        return _invoice_of_sale(instance)
 
     def perform_create(self, serializer):
         from django.db import transaction
@@ -103,6 +125,8 @@ class SaleViewSet(TenantScopedViewSet):
 
         from commerce.services import commit_sale_stock
 
+        # A reported sale is ZATCA-locked: correct it via a credit note, not edits.
+        self._assert_not_zatca_locked(serializer.instance)
         self._check_tenant_ownership(serializer)
         try:
             with transaction.atomic():
@@ -125,10 +149,13 @@ class SaleViewSet(TenantScopedViewSet):
         return Response({"detail": "queued"}, status=status.HTTP_202_ACCEPTED)
 
 
-class SaleItemViewSet(TenantScopedViewSet):
+class SaleItemViewSet(ZatcaImmutableMixin, TenantScopedViewSet):
     queryset = SaleItem.objects.select_related("sale", "service", "product")
     serializer_class = SaleItemSerializer
     org_field = "sale__organization"
+
+    def zatca_locked_invoice(self, instance):
+        return _invoice_of_sale(instance.sale)
 
 
 class GiftCardViewSet(TenantScopedViewSet):
@@ -217,13 +244,15 @@ class StoreCreditTransactionViewSet(TenantScopedReadOnlyViewSet):
     org_field = "account__organization"
 
 
-class PackageViewSet(TenantScopedViewSet):
+class PackageViewSet(OrgRoleWriteGateMixin, TenantScopedViewSet):
+    write_min_role = UserRole.Role.OWNER
     queryset = Package.objects.prefetch_related("items__service")
     serializer_class = PackageSerializer
     search_fields = ["name"]
 
 
-class PackageItemViewSet(TenantScopedViewSet):
+class PackageItemViewSet(OrgRoleWriteGateMixin, TenantScopedViewSet):
+    write_min_role = UserRole.Role.OWNER
     queryset = PackageItem.objects.select_related("package", "service")
     serializer_class = PackageItemSerializer
     org_field = "package__organization"
@@ -269,7 +298,10 @@ class PackageRedemptionViewSet(TenantScopedReadOnlyViewSet):
     org_field = "customer_package__organization"
 
 
-class PricingRuleViewSet(TenantScopedViewSet):
+class PricingRuleViewSet(OrgRoleWriteGateMixin, TenantScopedViewSet):
+    # Owner-only writes (P2 decision): pricing rules carry the same price
+    # integrity as the catalog. The `quote` action below is read-only and open.
+    write_min_role = UserRole.Role.OWNER
     queryset = PricingRule.objects.select_related(
         "branch", "service", "product", "segment"
     )

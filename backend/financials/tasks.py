@@ -8,6 +8,8 @@ from django.utils import timezone
 
 from financials.gateways import MoyasarError, ZatcaError
 from financials.models import (
+    CreditNote,
+    DebitNote,
     EInvoice,
     Invoice,
     PaymentWebhookEvent,
@@ -18,6 +20,7 @@ from financials.services import (
     activate_zatca_device,
     execute_moyasar_refund,
     generate_e_invoice,
+    generate_note_e_invoice,
     onboard_zatca_device,
     process_payment_webhook_event,
     submit_e_invoice,
@@ -197,5 +200,36 @@ def generate_and_submit_e_invoice_task(invoice_id, device_id):
         e_invoice = generate_e_invoice(invoice, device)
     except ValidationError as exc:
         logger.warning("Invoice %s not e-invoiceable: %s", invoice_id, exc)
+        return
+    submit_e_invoice_task.delay(str(e_invoice.pk))
+
+
+@shared_task
+def generate_and_submit_note_task(note_id, document_type, device_id, invoice_type=""):
+    """Generate the credit/debit-note e-invoice (atomic, idempotent, same ICV
+    chain as invoices) and hand it to the shared submission task."""
+    model = (
+        CreditNote if document_type == EInvoice.DocumentType.CREDIT_NOTE else DebitNote
+    )
+    note = (
+        model.objects.select_related("organization", "original_invoice")
+        .filter(pk=note_id)
+        .first()
+    )
+    device = (
+        ZatcaDevice.objects.select_related("organization").filter(pk=device_id).first()
+    )
+    if note is None or device is None:
+        logger.info("Note %s or ZATCA device %s gone.", note_id, device_id)
+        return
+    try:
+        e_invoice = generate_note_e_invoice(
+            note,
+            device,
+            document_type=document_type,
+            invoice_type=invoice_type or None,
+        )
+    except ValidationError as exc:
+        logger.warning("Note %s not e-invoiceable: %s", note_id, exc)
         return
     submit_e_invoice_task.delay(str(e_invoice.pk))

@@ -417,6 +417,96 @@ def build_invoice_xml(e_invoice):
     return etree.tostring(root, xml_declaration=True, encoding="UTF-8").decode()
 
 
+def _note_amounts(gross):
+    """Split a VAT-inclusive note total into (net, tax) at the KSA 15% rate.
+
+    Credit/Debit notes store a single gross ``amount`` (VAT-inclusive, same
+    semantics as ``Invoice.total_amount``); ZATCA needs the net line-extension
+    amount and the VAT separately.
+    """
+    gross = Decimal(gross)
+    net = (gross / Decimal("1.15")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return net, gross - net
+
+
+def build_credit_debit_note_xml(e_invoice):
+    """Unsigned UBL 2.1 document for a credit (381) or debit (383) note.
+
+    ZATCA carries credit/debit notes on the *Invoice* schema, distinguished by
+    InvoiceTypeCode, and requires a ``cac:BillingReference`` to the original
+    invoice plus a reason for issuance (``cac:PaymentMeans/cbc:InstructionNote``).
+    """
+    from financials.models import EInvoice
+
+    note = e_invoice.credit_note or e_invoice.debit_note
+    if note is None:
+        raise ZatcaCryptoError("Note e-invoice has no credit_note/debit_note set.")
+    original_invoice = e_invoice.invoice
+    organization = e_invoice.organization
+    issued_at = note.issued_at or note.created_at
+    type_code = EInvoice.ZATCA_TYPE_CODE[e_invoice.document_type]
+    number = getattr(note, "credit_note_number", None) or note.debit_note_number
+    net, tax = _note_amounts(note.amount)
+
+    # The original invoice's reported UUID anchors the note to the ZATCA chain.
+    original_e_invoice = (
+        original_invoice.e_invoices.filter(document_type=EInvoice.DocumentType.INVOICE)
+        .exclude(status__in=(EInvoice.Status.REJECTED, EInvoice.Status.FAILED))
+        .order_by("created_at")
+        .first()
+    )
+
+    root = etree.Element(f"{{{UBL_NSMAP[None]}}}Invoice", nsmap=UBL_NSMAP)
+    _sub(root, CBC, "ProfileID", "reporting:1.0")
+    _sub(root, CBC, "ID", number)
+    _sub(root, CBC, "UUID", e_invoice.uuid)
+    _sub(root, CBC, "IssueDate", issued_at.date().isoformat())
+    _sub(root, CBC, "IssueTime", issued_at.time().replace(microsecond=0).isoformat())
+    subtype = (
+        "0200000"
+        if e_invoice.invoice_type == EInvoice.InvoiceType.SIMPLIFIED
+        else "0100000"
+    )
+    _sub(root, CBC, "InvoiceTypeCode", type_code, name=subtype)
+    _sub(root, CBC, "DocumentCurrencyCode", "SAR")
+    _sub(root, CBC, "TaxCurrencyCode", "SAR")
+    # BillingReference: the invoice this note adjusts (mandatory for 381/383).
+    billing = _sub(root, CAC, "BillingReference")
+    doc_ref = _sub(billing, CAC, "InvoiceDocumentReference")
+    _sub(doc_ref, CBC, "ID", original_invoice.invoice_number)
+    if original_e_invoice is not None:
+        _sub(doc_ref, CBC, "UUID", original_e_invoice.uuid)
+    _document_reference(root, "ICV", uuid=str(e_invoice.icv))
+    _document_reference(root, "PIH", embedded=e_invoice.previous_invoice_hash)
+    _supplier_party(root, organization)
+    _customer_party(root, original_invoice.customer)
+    # Reason for issuance — ZATCA mandates it on notes.
+    payment_means = _sub(root, CAC, "PaymentMeans")
+    _sub(payment_means, CBC, "PaymentMeansCode", "10")
+    _sub(
+        payment_means,
+        CBC,
+        "InstructionNote",
+        note.reason_text or note.reason_code or "Adjustment",
+    )
+    _tax_totals(root, e_invoice, taxable_amount=net, tax_amount=tax)
+    total = _sub(root, CAC, "LegalMonetaryTotal")
+    _sub(total, CBC, "LineExtensionAmount", _money(net), currencyID="SAR")
+    _sub(total, CBC, "TaxExclusiveAmount", _money(net), currencyID="SAR")
+    _sub(total, CBC, "TaxInclusiveAmount", _money(note.amount), currencyID="SAR")
+    _sub(total, CBC, "PrepaidAmount", "0.00", currencyID="SAR")
+    _sub(total, CBC, "PayableAmount", _money(note.amount), currencyID="SAR")
+    _invoice_line(
+        root,
+        line_id="1",
+        name=note.reason_text or f"Adjustment for {original_invoice.invoice_number}",
+        quantity=Decimal(1),
+        line_total=net,
+        tax_amount=tax,
+    )
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8").decode()
+
+
 # ---------------------------------------------------------------------------
 # Invoice hashing (ZATCA canonical transform)
 # ---------------------------------------------------------------------------

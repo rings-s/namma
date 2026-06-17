@@ -347,3 +347,87 @@ class SaleStockCommitmentTests(TestCase):
             commit_sale_stock(sale)
         self.product.refresh_from_db()
         self.assertEqual(self.product.stock_quantity, 10)
+
+
+class CatalogOwnerOnlyWriteTests(APITestCase):
+    """Service/ServiceCategory/Package/PricingRule writes are Owner-only (P2).
+
+    Reads stay open to any tenant member; the superuser escape hatch holds.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.org = Organization.objects.create(name="Cat", slug="cat")
+        cls.owner = User.objects.create_user(
+            email="cat-owner@namaa.sa", password="pass12345"
+        )
+        UserRole.objects.create(
+            user=cls.owner, organization=cls.org, role=UserRole.Role.OWNER
+        )
+        cls.manager = User.objects.create_user(
+            email="cat-manager@namaa.sa", password="pass12345"
+        )
+        UserRole.objects.create(
+            user=cls.manager, organization=cls.org, role=UserRole.Role.MANAGER
+        )
+        cls.superuser = User.objects.create_superuser(
+            email="root@namaa.sa", password="pass12345"
+        )
+        cls.service = Service.objects.create(
+            organization=cls.org, name="Cut", price=Decimal("100")
+        )
+
+    def _create_service(self, user):
+        self.client.force_authenticate(user)
+        return self.client.post(
+            "/api/v1/services/",
+            {"organization": str(self.org.id), "name": "Color", "price": "200"},
+            format="json",
+        )
+
+    def test_owner_can_create_service(self):
+        self.assertEqual(self._create_service(self.owner).status_code, 201)
+
+    def test_manager_cannot_create_service(self):
+        self.assertEqual(self._create_service(self.manager).status_code, 403)
+
+    def test_superuser_bypasses_the_owner_gate(self):
+        self.assertEqual(self._create_service(self.superuser).status_code, 201)
+
+    def test_manager_can_still_read_the_catalog(self):
+        self.client.force_authenticate(self.manager)
+        response = self.client.get("/api/v1/services/")
+        self.assertEqual(response.status_code, 200)
+        self.assertGreaterEqual(response.data["count"], 1)
+
+    def test_manager_cannot_update_service(self):
+        self.client.force_authenticate(self.manager)
+        response = self.client.patch(
+            f"/api/v1/services/{self.service.id}/",
+            {"price": "999"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403)
+        self.service.refresh_from_db()
+        self.assertEqual(self.service.price, Decimal("100"))
+
+    def test_manager_cannot_delete_service(self):
+        self.client.force_authenticate(self.manager)
+        response = self.client.delete(f"/api/v1/services/{self.service.id}/")
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(Service.objects.filter(pk=self.service.id).exists())
+
+    def test_manager_cannot_write_pricing_rule(self):
+        self.client.force_authenticate(self.manager)
+        response = self.client.post(
+            "/api/v1/pricing-rules/",
+            {
+                "organization": str(self.org.id),
+                "name": "Happy hour",
+                "rule_type": "time_based",
+                "adjustment_type": "percent",
+                "adjustment_value": "10",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403, response.data)

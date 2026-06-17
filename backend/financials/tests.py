@@ -1161,3 +1161,158 @@ class AuditTrailTests(MoyasarTestCase):
         entry = AuditLog.objects.get(action="payment.refund_processed")
         self.assertEqual(entry.user_id, self.owner.id)
         self.assertEqual(entry.entity_id, refund.id)
+
+
+class ZatcaReversalAndImmutabilityTests(ZatcaTestCase):
+    """ZATCA immutability + the credit/debit-note reversal pipeline (P3)."""
+
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        from organizations.models import Branch
+
+        cls.accountant = User.objects.create_user(
+            email="zatca-acct@namaa.sa", password="pass12345"
+        )
+        UserRole.objects.create(
+            user=cls.accountant, organization=cls.org, role=UserRole.Role.ACCOUNTANT
+        )
+        cls.marketer = User.objects.create_user(
+            email="zatca-mkt@namaa.sa", password="pass12345"
+        )
+        UserRole.objects.create(
+            user=cls.marketer, organization=cls.org, role=UserRole.Role.MARKETER
+        )
+        cls.branch = Branch.objects.create(organization=cls.org, name="Main")
+
+    def _report_invoice(self):
+        """Generate the invoice's e-invoice so it becomes ZATCA-locked."""
+        from financials.services import generate_e_invoice
+
+        self.activate_device()
+        return generate_e_invoice(self.invoice, self.device)
+
+    # --- Immutability -----------------------------------------------------
+
+    def test_invoice_patch_rejected_once_reported(self):
+        self._report_invoice()
+        self.client.force_authenticate(self.owner)
+        response = self.client.patch(
+            f"/api/v1/invoices/{self.invoice.id}/",
+            {"due_date": "2026-12-31"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 409, response.data)
+
+    def test_invoice_editable_before_it_is_reported(self):
+        self.client.force_authenticate(self.owner)
+        response = self.client.patch(
+            f"/api/v1/invoices/{self.invoice.id}/",
+            {"due_date": "2026-12-31"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+
+    def test_sale_patch_rejected_when_its_invoice_is_reported(self):
+        from commerce.models import Sale
+
+        sale = Sale.objects.create(
+            organization=self.org,
+            branch=self.branch,
+            sale_number="SALE-Z-1",
+            total_amount=Decimal("230.00"),
+            status=Sale.Status.COMPLETED,
+        )
+        self.invoice.sale = sale
+        self.invoice.save(update_fields=["sale"])
+        self._report_invoice()
+
+        self.client.force_authenticate(self.owner)
+        response = self.client.patch(
+            f"/api/v1/sales/{sale.id}/",
+            {"notes": "tampering"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 409, response.data)
+
+    # --- Credit-note pipeline --------------------------------------------
+
+    def test_full_credit_note_builds_381_with_billing_reference(self):
+        from financials.models import EInvoice
+        from financials.services import generate_note_e_invoice, issue_credit_note
+
+        invoice_e = self._report_invoice()
+        note = issue_credit_note(invoice=self.invoice, full=True, reason_text="Refund")
+        self.assertEqual(note.amount, Decimal("230.00"))
+
+        note_e = generate_note_e_invoice(
+            note, self.device, document_type=EInvoice.DocumentType.CREDIT_NOTE
+        )
+        self.assertEqual(note_e.document_type, EInvoice.DocumentType.CREDIT_NOTE)
+        # Same chain as the invoice: next ICV, PIH = the invoice's hash.
+        self.assertEqual(note_e.icv, invoice_e.icv + 1)
+        self.assertEqual(note_e.previous_invoice_hash, invoice_e.invoice_hash)
+        self.assertTrue(note_e.invoice_hash)
+        self.assertIn("InvoiceTypeCode", note_e.ubl_xml)
+        self.assertIn(">381<", note_e.ubl_xml)
+        self.assertIn("BillingReference", note_e.ubl_xml)
+        self.assertIn(self.invoice.invoice_number, note_e.ubl_xml)
+
+    def test_debit_note_builds_383(self):
+        from financials.models import EInvoice
+        from financials.services import generate_note_e_invoice, issue_debit_note
+
+        self._report_invoice()
+        note = issue_debit_note(
+            invoice=self.invoice, amount=Decimal("57.50"), reason_text="Extra"
+        )
+        note_e = generate_note_e_invoice(
+            note, self.device, document_type=EInvoice.DocumentType.DEBIT_NOTE
+        )
+        self.assertEqual(note_e.document_type, EInvoice.DocumentType.DEBIT_NOTE)
+        self.assertIn(">383<", note_e.ubl_xml)
+
+    def test_credit_notes_cannot_exceed_invoice_total(self):
+        from django.core.exceptions import ValidationError
+
+        from financials.services import issue_credit_note
+
+        self._report_invoice()
+        issue_credit_note(invoice=self.invoice, full=True)  # credits the whole 230
+        with self.assertRaises(ValidationError):
+            issue_credit_note(invoice=self.invoice, amount=Decimal("0.01"))
+
+    def test_credit_note_requires_a_reported_invoice(self):
+        from django.core.exceptions import ValidationError
+
+        from financials.services import issue_credit_note
+
+        # No e-invoice generated yet -> nothing to reverse.
+        with self.assertRaises(ValidationError):
+            issue_credit_note(invoice=self.invoice, full=True)
+
+    # --- Authorization (explicit role set, not rank) ----------------------
+
+    def test_accountant_can_issue_credit_note(self):
+        self._report_invoice()
+        self.client.force_authenticate(self.accountant)
+        response = self.client.post(
+            f"/api/v1/invoices/{self.invoice.id}/credit-note/",
+            {"full": True, "reason_text": "Refund"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 202, response.data)
+        self.assertEqual(self.invoice.credit_notes.count(), 1)
+
+    def test_marketer_cannot_issue_credit_note_despite_same_rank(self):
+        # Marketer shares rank 40 with Accountant; the explicit role set must
+        # still exclude them.
+        self._report_invoice()
+        self.client.force_authenticate(self.marketer)
+        response = self.client.post(
+            f"/api/v1/invoices/{self.invoice.id}/credit-note/",
+            {"full": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 403, response.data)
+        self.assertEqual(self.invoice.credit_notes.count(), 0)

@@ -4,6 +4,7 @@ import json
 from django.conf import settings
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.http import HttpResponse
+from drf_spectacular.utils import extend_schema
 from rest_framework import generics, permissions, status
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
@@ -36,7 +37,11 @@ from communications.tasks import (
     send_sms_dispatch_task,
     send_whatsapp_dispatch_task,
 )
-from core.api import TenantScopedReadOnlyViewSet, TenantScopedViewSet
+from core.api import (
+    TenantScopedReadOnlyViewSet,
+    TenantScopedViewSet,
+    WebhookBodyLimitMixin,
+)
 from core.models import Channel
 
 
@@ -89,7 +94,7 @@ class ConsentRecordViewSet(TenantScopedViewSet):
     ordering_fields = ["granted_at", "created_at"]
 
 
-class SESWebhookView(generics.GenericAPIView):
+class SESWebhookView(WebhookBodyLimitMixin, generics.GenericAPIView):
     """Receiver for SES delivery events pushed by Amazon SNS.
 
     Every envelope is authenticated against AWS's embedded signature before
@@ -102,6 +107,7 @@ class SESWebhookView(generics.GenericAPIView):
     authentication_classes = []
     permission_classes = [permissions.AllowAny]
 
+    @extend_schema(exclude=True)  # AWS SNS-facing, not part of the public contract
     def post(self, request):
         try:
             # SNS posts JSON with a text/plain content type, so DRF's
@@ -144,7 +150,7 @@ class SESWebhookView(generics.GenericAPIView):
         return Response({"detail": "ok"})
 
 
-class WhatsAppWebhookView(generics.GenericAPIView):
+class WhatsAppWebhookView(WebhookBodyLimitMixin, generics.GenericAPIView):
     """Receiver for the Meta WhatsApp Cloud API webhook.
 
     GET performs Meta's subscription handshake — it echoes ``hub.challenge`` only
@@ -157,6 +163,7 @@ class WhatsAppWebhookView(generics.GenericAPIView):
     authentication_classes = []
     permission_classes = [permissions.AllowAny]
 
+    @extend_schema(exclude=True)  # Meta handshake, not part of the public contract
     def get(self, request):
         verify_token = settings.WHATSAPP_WEBHOOK_VERIFY_TOKEN
         mode = request.query_params.get("hub.mode")
@@ -167,6 +174,7 @@ class WhatsAppWebhookView(generics.GenericAPIView):
             return HttpResponse(challenge, content_type="text/plain")
         return HttpResponse("Verification failed", status=403)
 
+    @extend_schema(exclude=True)  # Meta-facing, not part of the public contract
     def post(self, request):
         if not verify_whatsapp_signature(
             request.body, request.headers.get("X-Hub-Signature-256", "")

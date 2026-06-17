@@ -140,9 +140,13 @@ class MeView(generics.RetrieveUpdateAPIView):
     http_method_names = ["get", "patch", "head", "options"]
 
     def get_object(self):
+        # API-key principals (no user row) have no profile to serve here.
+        if getattr(self.request.user, "pk", None) is None:
+            raise PermissionDenied("This endpoint is for user accounts, not API keys.")
         return self.request.user
 
     def retrieve(self, request, *args, **kwargs):
+        self.get_object()  # enforce the user-account guard above
         data = self.get_serializer(request.user).data
         data["roles"] = UserRoleSerializer(
             request.user.roles.select_related("organization", "branch"), many=True

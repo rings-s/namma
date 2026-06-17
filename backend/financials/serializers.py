@@ -61,6 +61,28 @@ class DebitNoteSerializer(serializers.ModelSerializer):
         read_only_fields = (*AUDIT_FIELDS, "debit_note_number")
 
 
+class ReversalRequestSerializer(serializers.Serializer):
+    """Input for the Invoice credit-note / debit-note reversal actions."""
+
+    full = serializers.BooleanField(required=False, default=False)
+    amount = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=False, min_value=0
+    )
+    reason_code = serializers.CharField(required=False, allow_blank=True, max_length=50)
+    reason_text = serializers.CharField(required=False, allow_blank=True)
+    zatca_device = serializers.UUIDField(required=False)
+    invoice_type = serializers.ChoiceField(
+        choices=EInvoice.InvoiceType.choices, required=False
+    )
+
+    def validate(self, attrs):
+        if not attrs.get("full") and attrs.get("amount") is None:
+            raise serializers.ValidationError(
+                "Provide either full=true or a positive amount."
+            )
+        return attrs
+
+
 class PaymentIntentSerializer(serializers.ModelSerializer):
     class Meta:
         model = PaymentIntent
