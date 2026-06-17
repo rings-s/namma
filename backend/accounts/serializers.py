@@ -7,6 +7,10 @@ from core.api import AUDIT_FIELDS
 
 
 class UserSerializer(serializers.ModelSerializer):
+    # Lets the Security page show 2FA state without probing the enable flow
+    # (MISSING_BACKEND #2). True only once the TOTP device is confirmed.
+    two_factor_enabled = serializers.SerializerMethodField()
+
     class Meta:
         model = User
         fields = [
@@ -18,6 +22,7 @@ class UserSerializer(serializers.ModelSerializer):
             "avatar_url",
             "is_active",
             "is_verified",
+            "two_factor_enabled",
             "last_login",
             "created_at",
             "updated_at",
@@ -27,10 +32,15 @@ class UserSerializer(serializers.ModelSerializer):
             "email",
             "is_active",
             "is_verified",
+            "two_factor_enabled",
             "last_login",
             "created_at",
             "updated_at",
         ]
+
+    def get_two_factor_enabled(self, obj) -> bool:
+        device = getattr(obj, "two_factor_device", None)
+        return bool(device and device.confirmed)
 
 
 class RegisterSerializer(serializers.ModelSerializer):
@@ -70,7 +80,24 @@ class TwoFactorCodeSerializer(serializers.Serializer):
     code = serializers.CharField(max_length=10)
 
 
+class UserRoleNestedUserSerializer(serializers.ModelSerializer):
+    """Minimal user identity for embedding in role/assignee pickers."""
+
+    full_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = ["id", "full_name", "email"]
+
+    def get_full_name(self, obj) -> str:
+        return obj.get_full_name() or obj.email
+
+
 class UserRoleSerializer(serializers.ModelSerializer):
+    # Embedded identity so the inbox/assign picker can show names, not raw
+    # UUIDs (MISSING_BACKEND #4). Write still takes the `user` id.
+    user_detail = UserRoleNestedUserSerializer(source="user", read_only=True)
+
     class Meta:
         model = UserRole
         fields = "__all__"

@@ -6,7 +6,12 @@ work around them. Resolve on the backend, then remove the entry.
 
 ## App Shell & Auth (`g_shell`)
 
-### 1. No per-request organization scoping on list endpoints
+### 1. ✅ RESOLVED — per-request organization scoping on list endpoints
+`TenantScopedQuerysetMixin.get_queryset` now honors `?organization=<id>`,
+narrowing within the user's tenant scope (never widening). Below is the
+original report.
+
+
 `core.api.TenantScopedViewSet` filters querysets by the user's `UserRole`
 membership across **all** their organizations, and the only filter backends
 enabled are `SearchFilter`/`OrderingFilter` (no `DjangoFilterBackend`, no
@@ -17,7 +22,11 @@ lists (e.g. dashboard `daily-metrics`, `goals`) are filtered to the current org
 - **Asked for:** a documented `?organization=<id>` query param (or an
   `X-Organization` header) honored by `TenantScopedQuerysetMixin`.
 
-### 2. `/me/` does not report two-factor status
+### 2. ✅ RESOLVED — `/me/` now reports two-factor status
+`UserSerializer` exposes a read-only `two_factor_enabled` (true once the TOTP
+device is confirmed). Below is the original report.
+
+
 `UserSerializer` exposes no `two_factor_enabled` flag, and there is no GET
 endpoint for `accounts.TwoFactorDevice`. The Security page therefore can't show
 whether 2FA is currently on; it offers both enable and disable flows and relies
@@ -34,7 +43,13 @@ the "This device" marker can't be rendered.
 
 ## Customer Lifecycle Engine (Prompt 2)
 
-### 4. Conversation/UserRole serializers return raw FK ids — no display names
+### 4. ⚠️ PARTIALLY RESOLVED — UserRole now embeds user identity
+`UserRoleSerializer` now embeds a read-only `user_detail` (id, full_name,
+email), so the assign picker can show names. The Conversation serializers
+(customer/assigned_to display names) are **not** yet nested and there is still
+no `GET /users/` endpoint — see below.
+
+
 `ConversationSerializer` (and `ConversationMessageSerializer`) expose
 `customer`, `assigned_to`, `branch` as bare ids, and `UserRoleSerializer` is
 `__all__` with no embedded user object — and there is **no list-users endpoint**

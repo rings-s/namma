@@ -167,9 +167,16 @@ class TenantScopedQuerysetMixin:
     def get_queryset(self):
         queryset = super().get_queryset()
         org_ids = self.allowed_organization_ids()
-        if org_ids is None:
-            return queryset
-        return queryset.filter(**{f"{self.org_field}__in": org_ids})
+        if org_ids is not None:
+            queryset = queryset.filter(**{f"{self.org_field}__in": org_ids})
+        # Optional server-side org narrowing for the multi-org switcher
+        # (MISSING_BACKEND #1): ?organization=<id> filters to one org the user
+        # already has access to. It can only narrow within the tenant scope
+        # above — never widen it — so it is safe even for superusers.
+        requested_org = self.request.query_params.get("organization")
+        if requested_org:
+            queryset = queryset.filter(**{self.org_field: requested_org})
+        return queryset
 
 
 class IdempotentCreateMixin:

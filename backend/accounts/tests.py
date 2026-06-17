@@ -372,3 +372,56 @@ class UserSessionTests(APITestCase):
         response = self.client.get("/api/v1/auth/sessions/")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.data), 0)
+
+
+class FrontendContractTests(APITestCase):
+    """Closes documented frontend gaps (MISSING_BACKEND #1, #2, #4)."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from organizations.models import Organization
+
+        cls.org = Organization.objects.create(name="Contract", slug="contract")
+        cls.user = User.objects.create_user(
+            email="contract@namaa.sa", password="pass12345", first_name="Lina"
+        )
+        cls.role = UserRole.objects.create(
+            user=cls.user, organization=cls.org, role=UserRole.Role.OWNER
+        )
+
+    def test_me_reports_two_factor_disabled_then_enabled(self):
+        self.client.force_authenticate(self.user)
+        body = self.client.get("/api/v1/me/").data
+        self.assertIn("two_factor_enabled", body)
+        self.assertFalse(body["two_factor_enabled"])
+
+        device = TwoFactorDevice.objects.create(
+            user=self.user, secret=TwoFactorDevice.generate_secret()
+        )
+        device.confirmed = True
+        device.save(update_fields=["confirmed"])
+        self.assertTrue(self.client.get("/api/v1/me/").data["two_factor_enabled"])
+
+    def test_user_role_embeds_user_identity(self):
+        self.client.force_authenticate(self.user)
+        row = self.client.get(f"/api/v1/user-roles/{self.role.id}/").data
+        self.assertEqual(row["user_detail"]["email"], "contract@namaa.sa")
+        self.assertEqual(row["user_detail"]["full_name"], "Lina")
+
+    def test_organization_query_param_narrows_lists(self):
+        from organizations.models import Organization
+
+        other = Organization.objects.create(name="Other", slug="contract-other")
+        UserRole.objects.create(
+            user=self.user, organization=other, role=UserRole.Role.OWNER
+        )
+        self.client.force_authenticate(self.user)
+        # Without the param: roles across both orgs are visible.
+        all_roles = self.client.get("/api/v1/user-roles/").data
+        self.assertEqual(all_roles["count"], 2)
+        # With ?organization=: narrowed to the one org.
+        scoped = self.client.get(
+            f"/api/v1/user-roles/?organization={self.org.id}"
+        ).data
+        self.assertEqual(scoped["count"], 1)
+        self.assertEqual(str(scoped["results"][0]["organization"]), str(self.org.id))
